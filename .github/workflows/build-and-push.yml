@@ -24,8 +24,16 @@ on:
         description: 'Optional passthrough, e.g. --build-arg INSTALL_FILE_1=foo.zip'
         required: false
         default: ""
-      zft_files:
-        description: "Space-separated filenames to fetch from zft.zedas.com into the version directory (must match Checksum.* entries or pass -i)"
+      fetch_map:
+        description: >-
+          One "zft/relative/path/file.zip repo/relative/dest/dir" pair per
+          line - the RU/DPBP/OPatch patches and the base installer/goldimage
+          don't live in the same repo directory, so a single source+dest
+          pair isn't enough. Example for the 19.32 SE2 build:
+          ora/Ora19/LINUX.X64_193000_db_home.zip OracleDatabase/SingleInstance/dockerfiles/19.3.0
+          ora/Ora19/patches/p6880880_190000_LINUX.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs
+          ora/Ora19/patches/p39657094_1932000DBRU_Generic.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs
+          ora/Ora19/patches/p39472050_190000_Linux-x86-64.zip OracleDatabase/SingleInstance/extensions/patching/patches/release_update
         required: true
       push_tag:
         description: "Tag to push to vsdock01.pcsoft.de:5000, e.g. oracle/database:19.32.0.0-se2"
@@ -37,18 +45,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # TODO: fill in the real zft.zedas.com path layout - this is a placeholder.
+      # https://zft.zedas.com/download/ aliases /home/pcsmailuser directly
+      # with no auth_basic/auth_request on that nginx location - it's
+      # currently unauthenticated (confirmed via a plain curl from outside
+      # the corp network). The -u below is forward-compatible: it's a
+      # no-op against an unauthenticated endpoint, but starts working the
+      # moment someone adds auth_basic to that location (which they should
+      # - this serves licensed Oracle installers to anyone who guesses the
+      # URL right now).
       - name: Download Oracle installer/patch files from zft.zedas.com
         env:
           ZFT_USER: ${{ secrets.ZFT_USER }}
           ZFT_PASSWORD: ${{ secrets.ZFT_PASSWORD }}
+          FETCH_MAP: ${{ inputs.fetch_map }}
         run: |
           set -euo pipefail
-          cd "OracleDatabase/SingleInstance/dockerfiles/${{ inputs.version }}"
-          for f in ${{ inputs.zft_files }}; do
+          while read -r src dest; do
+            [ -z "$src" ] && continue
+            mkdir -p "$dest"
             curl -fsSL -u "${ZFT_USER}:${ZFT_PASSWORD}" \
-              "https://zft.zedas.com/CHANGEME/${f}" -o "${f}"
-          done
+              "https://zft.zedas.com/download/${src}" -o "${dest}/$(basename "$src")"
+          done <<< "$FETCH_MAP"
 
       - name: Build image
         working-directory: OracleDatabase/SingleInstance/dockerfiles
