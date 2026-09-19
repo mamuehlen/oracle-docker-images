@@ -24,7 +24,7 @@
 #
 # Pull base image
 # ---------------
-FROM oraclelinux:8 as base
+FROM oraclelinux:10 as base
 
 # Labels
 # ------
