@@ -78,6 +78,12 @@ jobs:
 
       - name: Build image
         working-directory: OracleDatabase/SingleInstance/dockerfiles
+        env:
+          # Classic builder instead of BuildKit: BuildKit's image-pull path
+          # hit "failed to register layer: openat dev/ptmx: no such file
+          # or directory" pulling oraclelinux:9 on this host (known
+          # overlay2/device-layer bug, reproducible, not disk space).
+          DOCKER_BUILDKIT: "0"
         run: |
           set -euo pipefail
           ./buildContainerImage.sh \
