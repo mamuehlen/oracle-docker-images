@@ -38,9 +38,18 @@ on:
       push_tag:
         description: "Tag to push to vsdock01.pcsoft.de:5000, e.g. oracle/database:19.32.0.0-se2"
         required: true
+  # TEMPORARY: workflow_dispatch (UI or API) 404s for a workflow that has
+  # never run and isn't on the default branch - this push trigger exists
+  # only to bootstrap that first run, then gets removed again. The job
+  # is guarded by `if:` below so a push-triggered run does nothing but
+  # register the workflow's existence with GitHub.
+  push:
+    branches: [zedas-patches]
+    paths: [.github/workflows/build-and-push.yml]
 
 jobs:
   build-and-push:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64, docker]
     steps:
       - uses: actions/checkout@v4
