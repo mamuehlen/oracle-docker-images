@@ -177,7 +177,11 @@ FROM base AS builder
 ARG DB_EDITION
 
 # Copy DB install file
-COPY --chown=oracle:dba $INSTALL_FILE_1 $INSTALL_RSP $INSTALL_DB_BINARIES_FILE $INSTALL_DIR/
+# stubs.tar: Patch 35775632 (fix for Bug 33794281) - replaces $ORACLE_HOME/lib/stubs
+# content before runInstaller's relink step, required for 19.3.0 base install to
+# succeed on Oracle Linux 9 (libasmclntsh19.ohso/libasmperl19.ohso link failure
+# otherwise - the 2019-era stub objects don't link against OL9's newer glibc/binutils).
+COPY --chown=oracle:dba $INSTALL_FILE_1 $INSTALL_RSP $INSTALL_DB_BINARIES_FILE stubs.tar $INSTALL_DIR/
 
 # Install DB software binaries
 USER oracle

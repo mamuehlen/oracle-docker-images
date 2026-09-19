@@ -53,6 +53,8 @@ cd "$ORACLE_HOME"       && \
 mv "$INSTALL_DIR"/"$INSTALL_FILE_1" "$ORACLE_HOME"/ && \
 unzip "$INSTALL_FILE_1" && \
 rm "$INSTALL_FILE_1"    && \
+mkdir -p "$ORACLE_HOME"/lib/stubs && \
+tar -xf "$INSTALL_DIR"/stubs.tar -C "$ORACLE_HOME"/lib/stubs && \
 "$ORACLE_HOME"/runInstaller -silent -force -waitforcompletion -responsefile "$INSTALL_DIR"/"$INSTALL_RSP" -ignorePrereqFailure && \
 cd "$HOME"
 
