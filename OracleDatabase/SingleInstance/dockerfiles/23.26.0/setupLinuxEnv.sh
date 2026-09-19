@@ -29,7 +29,7 @@ mkdir -p "$ORACLE_BASE"/oradata /home/oracle && \
 mkdir -p "$ORACLE_HOME" && \
 chmod ug+x "$ORACLE_BASE"/*.sh && \
 dnf update -y && \
-dnf install -y oraclelinux-developer-release-el8 && \
+dnf install -y oraclelinux-developer-release-el$(rpm -E %{rhel}) && \
 dnf -y install oracle-ai-database-preinstall-26ai openssl hostname file expect && \
 rm -rf /var/cache/yum && \
 ln -s "$ORACLE_BASE"/"$PWD_FILE" /home/oracle/ && \
