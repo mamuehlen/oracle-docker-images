@@ -1,0 +1,78 @@
+name: Build and push Oracle DB image
+
+# Manual trigger only - this repo is private, but the self-hosted runner's
+# mounted docker socket is effectively root on the host, so no automatic
+# triggers (push/pull_request) are wired up here on purpose.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version directory under OracleDatabase/SingleInstance/dockerfiles/ (e.g. 19.3.0, 23.26.0)"
+        required: true
+      edition_flag:
+        description: "Edition flag for buildContainerImage.sh: -e (EE), -s (SE2), -x (XE), -f (Free)"
+        required: true
+        default: "-s"
+      patching:
+        description: "Also apply the extensions/patching extension (-p)"
+        type: boolean
+        default: false
+      image_tag:
+        description: "Local image name:tag to build, e.g. oracle/database:19.32.0.0-se2"
+        required: true
+      build_arg_overrides:
+        description: 'Optional passthrough, e.g. --build-arg INSTALL_FILE_1=foo.zip'
+        required: false
+        default: ""
+      zft_files:
+        description: "Space-separated filenames to fetch from zft.zedas.com into the version directory (must match Checksum.* entries or pass -i)"
+        required: true
+      push_tag:
+        description: "Tag to push to vsdock01.pcsoft.de:5000, e.g. oracle/database:19.32.0.0-se2"
+        required: true
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, linux, x64, docker]
+    steps:
+      - uses: actions/checkout@v4
+
+      # TODO: fill in the real zft.zedas.com path layout - this is a placeholder.
+      - name: Download Oracle installer/patch files from zft.zedas.com
+        env:
+          ZFT_USER: ${{ secrets.ZFT_USER }}
+          ZFT_PASSWORD: ${{ secrets.ZFT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "OracleDatabase/SingleInstance/dockerfiles/${{ inputs.version }}"
+          for f in ${{ inputs.zft_files }}; do
+            curl -fsSL -u "${ZFT_USER}:${ZFT_PASSWORD}" \
+              "https://zft.zedas.com/CHANGEME/${f}" -o "${f}"
+          done
+
+      - name: Build image
+        working-directory: OracleDatabase/SingleInstance/dockerfiles
+        run: |
+          set -euo pipefail
+          ./buildContainerImage.sh \
+            -v "${{ inputs.version }}" \
+            ${{ inputs.edition_flag }} \
+            ${{ inputs.patching == 'true' && '-p' || '' }} \
+            -t "${{ inputs.image_tag }}" \
+            ${{ inputs.build_arg_overrides != '' && format('-o "{0}"', inputs.build_arg_overrides) || '' }}
+
+      # One-time host setup required before this step works:
+      # add "vsdock01.pcsoft.de:5000" to /etc/docker/daemon.json's
+      # "insecure-registries" on the runner host and restart docker,
+      # since that endpoint is plain HTTP (bypasses the Traefik proxy
+      # in front of the HTTPS route on purpose - see the 499/timeout
+      # investigation this workflow grew out of).
+      - name: Push to internal registry
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "${REGISTRY_PASSWORD}" | docker login vsdock01.pcsoft.de:5000 -u "${REGISTRY_USER}" --password-stdin
+          docker tag "${{ inputs.image_tag }}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
+          docker push "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
