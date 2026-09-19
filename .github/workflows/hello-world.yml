@@ -1,0 +1,17 @@
+name: Hello World (self-hosted runner smoke test)
+
+# Trivial manual job to verify the self-hosted runner registers, picks up
+# jobs by label, has docker socket access via the host, and can reach the
+# internal registry - before trusting it with the real (long, large)
+# Oracle image build/push workflow.
+on:
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: [self-hosted, linux, x64, docker]
+    steps:
+      - run: echo "hello world from $(hostname)"
+      - run: docker version
+      - name: Check reachability of vsdock01.pcsoft.de:5000
+        run: curl -sk -o /dev/null -w "HTTP %{http_code}\n" http://vsdock01.pcsoft.de:5000/v2/
