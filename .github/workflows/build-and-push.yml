@@ -38,6 +38,17 @@ on:
       push_tag:
         description: "Tag to push to vsdock01.pcsoft.de:5000, e.g. oracle/database:19.32.0.0-se2"
         required: true
+      expected_patches:
+        description: >-
+          Space-separated OPatch patch numbers that must show up in
+          `opatch lspatches` before pushing is allowed, e.g.
+          "39472050 39657094" for the 19.32 SE2 build. Leave empty to
+          skip this check. This is the safety net against a forgotten
+          `patching` checkbox or a bad fetch_map shipping an unpatched
+          image with a patched-looking tag - it happened twice before
+          this check existed (see CI.md).
+        required: false
+        default: ""
   # TEMPORARY: workflow_dispatch (UI or API) 404s for a workflow that has
   # never run and isn't on the default branch - this push trigger exists
   # only to bootstrap that first run, then gets removed again. The job
@@ -77,6 +88,7 @@ jobs:
           done <<< "$FETCH_MAP"
 
       - name: Build image
+        id: build
         working-directory: OracleDatabase/SingleInstance/dockerfiles
         run: |
           set -euo pipefail
@@ -86,6 +98,37 @@ jobs:
             ${{ inputs.patching && '-p' || '' }} \
             -t "${{ inputs.image_tag }}" \
             ${{ inputs.build_arg_overrides != '' && format('-o "{0}"', inputs.build_arg_overrides) || '' }}
+          # buildContainerImage.sh -p never overwrites the requested
+          # image_tag - it writes the patched result as "<image_tag>-ext"
+          # instead, so that's the one downstream steps need to use
+          # whenever patching was applied.
+          SRC_TAG="${{ inputs.image_tag }}"
+          if [ "${{ inputs.patching }}" = "true" ]; then
+            SRC_TAG="${SRC_TAG}-ext"
+          fi
+          echo "src_tag=${SRC_TAG}" >> "$GITHUB_OUTPUT"
+
+      # Safety net: a forgotten `patching` checkbox, a broken fetch_map, or
+      # a GitHub Actions expression bug (all three have actually happened -
+      # see CI.md) would otherwise silently ship an unpatched image under a
+      # patched-looking tag. Fails loudly instead if expected_patches is set.
+      - name: Verify patch level
+        if: inputs.expected_patches != ''
+        run: |
+          set -euo pipefail
+          ACTUAL=$(docker run --rm --entrypoint bash "${{ steps.build.outputs.src_tag }}" \
+            -c '$ORACLE_HOME/OPatch/opatch lspatches')
+          echo "$ACTUAL"
+          MISSING=""
+          for p in ${{ inputs.expected_patches }}; do
+            if ! grep -q "^${p};" <<< "$ACTUAL"; then
+              MISSING="${MISSING} ${p}"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing expected patch(es):${MISSING} - refusing to push ${{ steps.build.outputs.src_tag }}"
+            exit 1
+          fi
 
       # One-time host setup required before this step works:
       # add "vsdock01.pcsoft.de:5000" to /etc/docker/daemon.json's
@@ -99,13 +142,6 @@ jobs:
           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
-          # buildContainerImage.sh -p never overwrites the requested
-          # image_tag - it writes the patched result as "<image_tag>-ext"
-          # instead, so that's the one to push when patching was applied.
-          SRC_TAG="${{ inputs.image_tag }}"
-          if [ "${{ inputs.patching }}" = "true" ]; then
-            SRC_TAG="${SRC_TAG}-ext"
-          fi
           echo "${REGISTRY_PASSWORD}" | docker login vsdock01.pcsoft.de:5000 -u "${REGISTRY_USER}" --password-stdin
-          docker tag "${SRC_TAG}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
+          docker tag "${{ steps.build.outputs.src_tag }}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
           docker push "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"

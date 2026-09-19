@@ -61,6 +61,7 @@ second bug so confusing: the push step correctly went looking for the
 | `build_arg_overrides` | Optional extra `--build-arg ...` passthrough (rarely needed - see 23.26 example) |
 | `fetch_map` | One `"zft/relative/path/file.zip repo/relative/dest/dir"` pair per line - see below |
 | `push_tag` | Tag pushed to `vsdock01.pcsoft.de:5000` |
+| `expected_patches` | Space-separated OPatch patch numbers that must be present before pushing is allowed (e.g. `"39472050 39657094"`) - **always set this when `patching=true`**, see "Verifying a push" below |
 
 ### `fetch_map`
 
@@ -83,14 +84,15 @@ workflow's `-u` is a no-op placeholder for whenever that changes.
   "image_tag": "oracle/database:19.32.0.0-se2",
   "build_arg_overrides": "",
   "fetch_map": "ora/Ora19/LINUX.X64_193000_db_home.zip OracleDatabase/SingleInstance/dockerfiles/19.3.0\nora/Ora19/patches/p6880880_190000_LINUX.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs\nora/Ora19/patches/p39657094_1932000DBRU_Generic.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs\nora/Ora19/patches/p39472050_190000_Linux-x86-64.zip OracleDatabase/SingleInstance/extensions/patching/patches/release_update",
-  "push_tag": "oracle/database:19.32.0.0-se2"
+  "push_tag": "oracle/database:19.32.0.0-se2",
+  "expected_patches": "39472050 39657094"
 }
 ```
 
 To build a *different* RU later: swap the two `patches/` filenames and
-patch numbers in `fetch_map` for the new RU/DPBP zips (upload them to
-`zft.zedas.com` first, same `Ora19/patches/` layout). OPatch
-(`p6880880`) rarely needs to change.
+patch numbers in `fetch_map` **and** `expected_patches` for the new
+RU/DPBP zips (upload them to `zft.zedas.com` first, same
+`Ora19/patches/` layout). OPatch (`p6880880`) rarely needs to change.
 
 ### 23.26.0 SE2 via the 23.26.3 Gold Image
 
@@ -107,9 +109,12 @@ release than what's currently the default:
   "image_tag": "oracle/database:23.26.3-se2",
   "build_arg_overrides": "",
   "fetch_map": "ora/Ora23.26/p39581612_230000_Linux-x86-64.zip OracleDatabase/SingleInstance/dockerfiles/23.26.0",
-  "push_tag": "oracle/database:23.26.3-se2"
+  "push_tag": "oracle/database:23.26.3-se2",
+  "expected_patches": "39578879"
 }
 ```
+
+(`39578879` is the Gold Image's own baked-in Database RU - 26ai ships the RU as part of the install file itself rather than a separate patch step, but it's still a normal registered OPatch entry, so the same safety net applies.)
 
 To build a future Gold Image release (e.g. 23.26.4 once that RU exists):
 override the install file without touching the Containerfile:
@@ -137,12 +142,20 @@ and point `fetch_map` at the new zip's location on zft.zedas.com.
 
 ## Verifying a push
 
-Don't trust a green "Push to internal registry" step alone - it only
-proves *a* tag was pushed, not that it's the *right* content (see the
-`patching` boolean gotcha above). Pull independently from a host that
-was never involved in the build/push (a different machine's local
-image cache can otherwise silently mask a bad push) and check the
-patch level directly:
+The workflow has a built-in **"Verify patch level"** step: set
+`expected_patches` and it runs `opatch lspatches` against the freshly
+built image and fails the job (before anything gets pushed) if any
+expected patch number is missing. This is the actual fix for the
+`patching` bugs described above, not just documentation - **always set
+`expected_patches` whenever you set `patching=true`**, and it's cheap
+to set even when `patching=false` (see the 23.26 example).
+
+That said, the check only proves the image the runner just built and
+pushed has the right patches *at push time* - if you want to confirm
+what's *actually sitting in the registry* right now (e.g. after a
+manual push, or to double check months later), pull independently from
+a host that was never involved in the build/push (a different
+machine's local image cache can otherwise silently mask a bad push):
 
 ```bash
 docker pull vsdock01.pcsoft.de:5000/oracle/database:<tag>
