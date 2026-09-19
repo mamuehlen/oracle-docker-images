@@ -34,12 +34,21 @@ account added as a collaborator).
 
 **`patching` must be a real JSON boolean in the API payload
 (`"patching": true`), not the string `"true"`.** It's declared as
-`type: boolean` in the workflow; dispatching it as a string silently
-gets treated as unset, so `-p` never gets passed to
-`buildContainerImage.sh` and the pushed image is the *unpatched* base
-- this happened for real once, shipping an unpatched `19.32.0.0-se2`
-that only had to be caught by an independent `opatch lspatches` check
-on another host after the push (see "Verifying a push" below).
+`type: boolean` in the workflow. Sending it as a string was the first
+version of this bug. The second, subtler version: even with a real
+boolean, `${{ inputs.patching == 'true' && '-p' || '' }}` in the "Build
+image" step is *itself* wrong - GitHub Actions expressions compare a
+boolean and a string by converting both to numbers, `'true'` becomes
+`NaN`, and `NaN != 1` (true's numeric form), so the comparison is
+always false regardless of the input's actual value. Use the boolean
+directly instead: `${{ inputs.patching && '-p' || '' }}`. Both versions
+of this bug shipped an *unpatched* `19.32.0.0-se2` at least once each,
+only caught by an independent `opatch lspatches` check on another host
+after the push (see "Verifying a push" below) - the "Push to internal
+registry" step's plain string interpolation (`[ "${{ inputs.patching }}"
+= "true" ]`) doesn't have this problem, which is exactly what made the
+second bug so confusing: the push step correctly went looking for the
+`-ext` image while the build step had silently never built one.
 
 ## Inputs
 

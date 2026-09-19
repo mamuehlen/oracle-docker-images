@@ -83,7 +83,7 @@ jobs:
           ./buildContainerImage.sh \
             -v "${{ inputs.version }}" \
             ${{ inputs.edition_flag }} \
-            ${{ inputs.patching == 'true' && '-p' || '' }} \
+            ${{ inputs.patching && '-p' || '' }} \
             -t "${{ inputs.image_tag }}" \
             ${{ inputs.build_arg_overrides != '' && format('-o "{0}"', inputs.build_arg_overrides) || '' }}
 
