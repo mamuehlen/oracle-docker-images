@@ -32,6 +32,15 @@ repo (it's a personal-namespace repo, so a collaborator token maxes out
 at "Write" - use a token from the repo owner's own account, not a bot
 account added as a collaborator).
 
+**`patching` must be a real JSON boolean in the API payload
+(`"patching": true`), not the string `"true"`.** It's declared as
+`type: boolean` in the workflow; dispatching it as a string silently
+gets treated as unset, so `-p` never gets passed to
+`buildContainerImage.sh` and the pushed image is the *unpatched* base
+- this happened for real once, shipping an unpatched `19.32.0.0-se2`
+that only had to be caught by an independent `opatch lspatches` check
+on another host after the push (see "Verifying a push" below).
+
 ## Inputs
 
 | Input | Meaning |
@@ -61,7 +70,7 @@ workflow's `-u` is a no-op placeholder for whenever that changes.
 {
   "version": "19.3.0",
   "edition_flag": "-s",
-  "patching": "true",
+  "patching": true,
   "image_tag": "oracle/database:19.32.0.0-se2",
   "build_arg_overrides": "",
   "fetch_map": "ora/Ora19/LINUX.X64_193000_db_home.zip OracleDatabase/SingleInstance/dockerfiles/19.3.0\nora/Ora19/patches/p6880880_190000_LINUX.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs\nora/Ora19/patches/p39657094_1932000DBRU_Generic.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs\nora/Ora19/patches/p39472050_190000_Linux-x86-64.zip OracleDatabase/SingleInstance/extensions/patching/patches/release_update",
@@ -85,7 +94,7 @@ release than what's currently the default:
 {
   "version": "23.26.0",
   "edition_flag": "-s",
-  "patching": "false",
+  "patching": false,
   "image_tag": "oracle/database:23.26.3-se2",
   "build_arg_overrides": "",
   "fetch_map": "ora/Ora23.26/p39581612_230000_Linux-x86-64.zip OracleDatabase/SingleInstance/dockerfiles/23.26.0",
@@ -116,6 +125,26 @@ and point `fetch_map` at the new zip's location on zft.zedas.com.
   bug (`failed to register layer: openat dev/ptmx: no such file or
   directory`) pulling any Oracle Linux base image (both 8 and 9), fixed
   in this version.
+
+## Verifying a push
+
+Don't trust a green "Push to internal registry" step alone - it only
+proves *a* tag was pushed, not that it's the *right* content (see the
+`patching` boolean gotcha above). Pull independently from a host that
+was never involved in the build/push (a different machine's local
+image cache can otherwise silently mask a bad push) and check the
+patch level directly:
+
+```bash
+docker pull vsdock01.pcsoft.de:5000/oracle/database:<tag>
+docker run --rm --entrypoint bash vsdock01.pcsoft.de:5000/oracle/database:<tag> \
+  -c '$ORACLE_HOME/OPatch/opatch lspatches'
+```
+
+For a 19.x RU/DPBP build, expect to see the RU and DPBP patch numbers
+from `fetch_map` in the output - if all you see is the base install's
+original RU (e.g. `29517242;Database Release Update : 19.3.0.0.190416`
+for a plain 19.3.0 base), the patching step didn't actually run.
 
 ## Known open item
 

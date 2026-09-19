@@ -99,6 +99,13 @@ jobs:
           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
+          # buildContainerImage.sh -p never overwrites the requested
+          # image_tag - it writes the patched result as "<image_tag>-ext"
+          # instead, so that's the one to push when patching was applied.
+          SRC_TAG="${{ inputs.image_tag }}"
+          if [ "${{ inputs.patching }}" = "true" ]; then
+            SRC_TAG="${SRC_TAG}-ext"
+          fi
           echo "${REGISTRY_PASSWORD}" | docker login vsdock01.pcsoft.de:5000 -u "${REGISTRY_USER}" --password-stdin
-          docker tag "${{ inputs.image_tag }}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
+          docker tag "${SRC_TAG}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
           docker push "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
