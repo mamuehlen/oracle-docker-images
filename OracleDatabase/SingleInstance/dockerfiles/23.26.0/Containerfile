@@ -10,15 +10,17 @@
 # 
 # REQUIRED FILES TO BUILD THIS IMAGE
 # ----------------------------------
-# (1) LINUX.X64_2326000_db_home.zip
-#     Download Oracle Database 26ai Enterprise Edition or Standard Edition 2 for Linux x64
-#     from http://www.oracle.com/technetwork/database/enterprise-edition/downloads/index.html
+# (1) p39581612_230000_Linux-x86-64.zip
+#     23.26.3.0.0 DB RU Gold Image (July 2026 CPU) from My Oracle Support.
+#     SE2 is only installable via this Gold Image (unofficial preview ahead
+#     of the planned October 2026 GA per MOS note PNEWS1360); the base
+#     23.26.0 db_home.zip does not offer SE2 as an install option.
 #
 # HOW TO BUILD THIS IMAGE
 # -----------------------
 # Put all downloaded files in the same directory as this Containerfile
-# Run: 
-#      $ docker build -t oracle/database:23.26.0-${EDITION} .
+# Run:
+#      $ docker build -t oracle/database:23.26.3-${EDITION} .
 #
 # Pull base image
 # ---------------
@@ -29,8 +31,8 @@ FROM oraclelinux:8 as base
 LABEL "provider"="Oracle"                                                           \
       "maintainer"="Oracle Database Container Team <container-team_ww@oracle.com>"  \
       "vendor"="Oracle Corporation"                                                 \
-      "version"="23.26.0"                                                           \
-      "release"="23.26.0"                                                           \
+      "version"="23.26.3"                                                           \
+      "release"="23.26.3"                                                           \
       "name"="Oracle Database 26ai"                                                 \
       "summary"="Oracle Database 26ai"                                              \
       "description"="Container Image for Oracle Database Server Release 26ai"       \
@@ -44,7 +46,7 @@ LABEL "provider"="Oracle"                                                       
 
 # Argument to control removal of components not needed after db software installation
 ARG SLIMMING=true
-ARG INSTALL_FILE_1="LINUX.X64_2326000_db_home.zip"
+ARG INSTALL_FILE_1="p39581612_230000_Linux-x86-64.zip"
 ARG BACKUP_MODULE_URL=""
 ARG BACKUP_MODULE_LOCAL_FILE=""
 
