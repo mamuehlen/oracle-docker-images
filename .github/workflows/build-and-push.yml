@@ -219,22 +219,6 @@ jobs:
             ${{ inputs.edition_flag }} \
             -t "${{ inputs.image_tag }}-base"
 
-      # --add-host buildkitsandbox:127.0.0.1: buildFaststart.sh calls
-      # createDB.sh directly at build time, which always asks dbca to also
-      # create a listener - dbca then runs netca to auto-configure it, which
-      # resolves its own hostname to pick a bind address. That works in a
-      # real container and in a local `podman build` RUN step (both give
-      # their own hostname a resolvable /etc/hosts entry), but not in this
-      # self-hosted runner's BuildKit (`docker buildx`) RUN steps - their
-      # ephemeral sandbox hostname is literally "buildkitsandbox" and has no
-      # /etc/hosts entry at all, so netca failed with "No valid IP Address
-      # returned for the host buildkitsandbox" (caught by testing, the first
-      # real CI run of this extension). Pre-creating a listener ourselves to
-      # dodge this doesn't work either - dbca refuses outright if one by
-      # that name already exists ("DBT-07503"), also caught by testing.
-      # --add-host makes BuildKit populate that entry directly (root-level,
-      # outside the build sandbox) instead - oracle (the non-root user
-      # buildFaststart.sh runs as) can't write /etc/hosts itself.
       - name: Build faststart extension
         id: faststart
         if: inputs.build_faststart
@@ -246,7 +230,7 @@ jobs:
             -b "${{ steps.build.outputs.src_tag }}" \
             -t "${FASTSTART_TAG}" \
             -x faststart \
-            -o "--build-arg BASE_IMAGE_LEAN=${{ inputs.image_tag }}-base --add-host buildkitsandbox:127.0.0.1"
+            -o "--build-arg BASE_IMAGE_LEAN=${{ inputs.image_tag }}-base"
           echo "faststart_tag=${FASTSTART_TAG}" >> "$GITHUB_OUTPUT"
 
       # Smoke test both character-set variants end-to-end (decompress,
