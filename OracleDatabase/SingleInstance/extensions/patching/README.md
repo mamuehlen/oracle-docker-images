@@ -252,7 +252,38 @@ Therefore:
 With the stock seed (`REGENERATE_SEED=false`) the PDB exists after dbca and
 the hook is a no-op, as it is for `NON_CDB=true`.
 
-### Setup hooks shipped by this extension
+#### Build sequencing for the dual-charset faststart design
+
+Root must end up AL32UTF8 - not just preference, Oracle enforces it: a PDB
+can only be opened/plugged into a root whose character set is a superset
+of the PDB's. So `INTERNAL_CONVERT` order matters, since it only works
+subset->superset:
+
+1. build the throwaway CDB in US7ASCII (as today)
+2. clone the WE8ISO8859P15-target PDB from the *still-US7ASCII* PDB$SEED
+   first, then convert *that PDB* to WE8ISO8859P15 - valid (US7ASCII is a
+   subset of WE8ISO8859P15)
+3. only *afterwards* convert CDB$ROOT + PDB$SEED themselves to AL32UTF8
+4. clone the AL32UTF8-target PDB from the now-AL32UTF8 PDB$SEED - no
+   conversion needed, it already matches
+
+Converting root to AL32UTF8 *before* branching off the ISO PDB would break
+step 2 (AL32UTF8 -> WE8ISO8859P15 is the forbidden superset->subset
+direction - the same DBT-11153 condition dbca itself warns about).
+
+7z vs xz for the archive: same core algorithm (LZMA/LZMA2), so no
+meaningful compression difference. 7z is a real multi-file archive with
+solid-mode cross-file dedup *and* selective per-file extraction (`7z x
+-x!pattern`, what gvenzl's own faststart uses to pull SYSTEM/SYSAUX
+separately); `tar | xz` gets the same solid-style cross-PDB dedup with a
+large enough dictionary (`--lzma2=dict=...`) but has to decompress the
+whole stream sequentially to reach a given file - no partial extraction.
+Since this design decompresses both PDBs and then drops the unwanted one
+anyway, that difference mostly doesn't matter here; 7z is still the
+better default choice simply because gvenzl's already-proven tooling uses
+it (`7zzs`, a single static binary, no extra runtime dependency).
+
+## Setup hooks shipped by this extension
 
 All in `$ORACLE_BASE/scripts/extensions/setup/` (run by `runOracle.sh` via
 `runUserScripts.sh` once after database creation, alphabetical order):
