@@ -179,44 +179,83 @@ in the build output of the `seedgen` stage - that line is the evidence.
 (The stock `Seed_Database.dfb` shipped in the SE2 installer is the same kind
 of RMAN-compressed backupset, so this is not a new licensing exposure.)
 
-### Character sets: the seed is US7ASCII, the setup hook converts it
+### Character sets: the seed is US7ASCII, dbca converts it itself
 
-Finding (2026-09-20): dbca does **not** convert the character set of a CDB
-clone template. With `ORACLE_CHARACTERSET=WE8ISO8859P15` it only warns
+Finding (2026-09-20, corrected 2026-09-20): with a **declared**
+`<characterSet>` element in the `.dbc` (what `dbca -createCloneTemplate`
+writes by default), dbca refuses to convert a CDB clone template and only
+warns:
 
     [WARNING] [DBT-11153] Character set specified (WE8ISO8859P15) is different from that of the character set (AL32UTF8) in the template.
 
-and creates the database in the template's character set (tested; also with
-the `<characterSet>` element removed from the `.dbc`). That would have left
-the image AL32UTF8-only, while ASSET customers run WE8ISO8859P15 and
-cargo/longhaultraffic AL32UTF8.
+`regenerateSeedTemplate.sh` therefore strips `<characterSet>` from the
+built template's `.dbc`. Once that element is gone, dbca behaves
+differently than the DBT-11153 case suggested at first: it **does**
+attempt an automatic conversion, right after `ALTER DATABASE OPEN`, to
+whatever `ORACLE_CHARACTERSET` was requested - confirmed in the golden
+image's own alert log:
 
-How does the *stock* seed manage it? Its alert log tells: `Database
-Characterset is US7ASCII` - Oracle ships the seed in US7ASCII and dbca then
-runs, after `ALTER DATABASE OPEN`,
+    Database Characterset is US7ASCII
+    ...
+    Completed: ALTER DATABASE OPEN
+    alter database character set INTERNAL_CONVERT AL32UTF8
+    Completed: alter database character set INTERNAL_CONVERT AL32UTF8
+    ...
+    Database Characterset is AL32UTF8
 
-    ALTER DATABASE CHARACTER SET INTERNAL_CONVERT WE8ISO8859P15;      -- CDB$ROOT
-    ALTER PLUGGABLE DATABASE PDB$SEED CLOSE IMMEDIATE;
-    ALTER PLUGGABLE DATABASE PDB$SEED OPEN RESTRICTED;
-    ALTER DATABASE CHARACTER SET INTERNAL_CONVERT WE8ISO8859P15;      -- in PDB$SEED
-    ALTER PLUGGABLE DATABASE PDB$SEED CLOSE IMMEDIATE;
-    ALTER PLUGGABLE DATABASE PDB$SEED OPEN READ ONLY;
+(That line is ~570 lines before the setup hook's own `CREATE PLUGGABLE
+DATABASE ORCLPDB1` in the same log - it happens inside dbca's own
+`-createDatabase`, long before any of our hooks run.) This conversion
+attempt only **succeeds** in the legitimate subset→superset direction
+(the normal, documented rule for `ALTER DATABASE CHARACTER SET
+INTERNAL_CONVERT` regardless of dbca); in the forbidden superset→subset
+direction it fails **silently**, with no warning at all once `<characterSet>` is stripped,
+leaving the database at its original charset. That silent-failure case is
+exactly what an earlier test (`cstest2`) hit: the throw-away CDB used to
+build that particular template was still AL32UTF8 at the time (built
+before the US7ASCII change below), so requesting WE8ISO8859P15 against it
+was the forbidden direction and silently did nothing - which looked at
+the time like "dbca never converts a clone template's charset, full
+stop." It converts fine; that test just asked for the wrong direction.
 
-US7ASCII is a strict subset of every character set, so this is the
-legitimate subset→superset direction; the dictionary is pure ASCII, so the
-conversion is a metadata update (~1 s).
+How does the *stock* seed manage the same problem? Its alert log tells:
+`Database Characterset is US7ASCII` - Oracle ships the seed in US7ASCII
+and dbca runs the identical two-step sequence (CDB$ROOT, then close/open
+restricted/convert/close/open read-only for PDB$SEED) against it. US7ASCII
+is a strict subset of every character set, so converting *from* it is
+always the legitimate, always-succeeding direction - which is exactly why
+building our own template in US7ASCII (rather than any real character
+set) makes every `ORACLE_CHARACTERSET` reachable.
 
 Therefore `regenerateSeedTemplate.sh` creates the throw-away CDB in
-**US7ASCII** (the template is byte-identical in size either way), and the
-extension's setup hook `scripts/extensions/setup/10_seedCreatePDB.sh` replays
-exactly dbca's statement sequence at first container start whenever
-`ORACLE_CHARACTERSET` differs from US7ASCII - validated against
-`V$NLS_VALID_VALUES`, refused if the database isn't US7ASCII. The whole CDB
-(root, PDB$SEED, PDB) ends up in `ORACLE_CHARACTERSET`, exactly like the
-stock image. (`INTERNAL_CONVERT` is dbca-internal and not a user-facing
-statement; we use it on the same kind of database, in the same state and
-direction dbca does. Mixed character sets inside the CDB would also be
-possible - Oracle allows them when CDB$ROOT is AL32UTF8 - but are not needed.)
+**US7ASCII** (the template is byte-identical in size either way, since the
+dictionary is pure ASCII regardless), and dbca's own automatic conversion
+- now that `<characterSet>` is stripped - does the rest by itself at every
+container start, no extra code needed for that part.
+
+The setup hook `scripts/extensions/setup/10_seedCreatePDB.sh` still
+carries an explicit, defensive `INTERNAL_CONVERT` block replaying dbca's
+own statement sequence, guarded by the same check (only runs if the
+database isn't already at the target charset, and refuses if it isn't
+still US7ASCII). Given the above, this is now believed to be a no-op
+safety net rather than the active mechanism in practice - every test to
+date shows dbca's own conversion already completing (visible in the
+alert log, well before the hook's own `CREATE PLUGGABLE DATABASE` line)
+before the hook even starts - but it's kept because it's a cheap,
+idempotent, correctly-guarded fallback, and because it's the one thing in
+this pipeline that hasn't been proven UNNECESSARY across the full input
+space (e.g. it hasn't specifically been tested with a template that isn't
+US7ASCII, which shouldn't happen given the build process but would be
+exactly the case where dbca's own silent-fail behavior above would
+otherwise leave the PDB\$SEED at the wrong charset with no error at all).
+
+(`INTERNAL_CONVERT` is dbca-internal and not a documented user-facing
+statement in the sense of being a supported public SQL command outside of
+dbca's own use, but it is not exotic: it is the exact, unmodified sequence
+dbca itself runs, on the same kind of database, in the same state and
+direction. Mixed character sets inside one CDB would also be architecturally
+possible - Oracle allows it when CDB$ROOT is AL32UTF8 - but are not needed
+here, since each container only ever creates the one customer PDB.)
 
 ### DBT-10312: the PDB is created by the setup hook, not by dbca
 
