@@ -86,38 +86,6 @@ export ALLOCATED_MEMORY=$((memory/1024/1024))
 # already have it set right.
 sed -i -e 's|^numberOfPDBs=.*|numberOfPDBs=0|' "${SCRIPT_BASE_DIR}/dbca.rsp.tmpl"
 
-# createDB.sh unconditionally passes "-createListener LISTENER:1521" to dbca,
-# which makes dbca invoke netca to auto-configure that listener if none by
-# that name is already running - netca resolves its own hostname to bind to,
-# which works fine in a real container (docker/podman populate /etc/hosts
-# with a resolvable entry for the container's own hostname) and in a local
-# `podman build` RUN step (same reason), but NOT in a GitHub Actions
-# self-hosted runner's BuildKit (`docker buildx`) RUN step: its ephemeral
-# build-sandbox hostname has no /etc/hosts entry at all, so netca fails hard
-# with "No valid IP Address returned for the host buildkitsandbox" - caught
-# by testing (2026-09-20, first real CI run of this extension). dbca skips
-# netca entirely if a listener by that name is already running, so start one
-# ourselves first with a static, always-resolvable address - the exact fix
-# extensions/patching/regenerateSeedTemplate.sh already uses for the same
-# underlying "dbca insists on a running listener" problem (there avoided by
-# never passing -createListener to its own raw dbca call at all; not an
-# option here since createDB.sh's own dbca call is what does that,
-# unconditionally, and reimplementing createDB.sh's version/TDE/OMF-aware
-# dbca invocation here isn't worth it just to drop one flag).
-mkdir -p "${ORACLE_HOME}/network/admin"
-cat > "${ORACLE_HOME}/network/admin/listener.ora" <<EOF
-LISTENER =
-(DESCRIPTION_LIST =
-  (DESCRIPTION =
-    (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1))
-    (ADDRESS = (PROTOCOL = TCP)(HOST = 127.0.0.1)(PORT = 1521))
-  )
-)
-DIAG_ADR_ENABLED = off
-EOF
-lsnrctl start >/dev/null
-log "pre-started a static listener on 127.0.0.1:1521 (works around netca's hostname lookup failing in a BuildKit build sandbox)"
-
 log "creating CDB\$ROOT + PDB\$SEED via createDB.sh..."
 "${SCRIPT_BASE_DIR}/${CREATE_DB_FILE}" "${ORACLE_SID}" "${ORACLE_PDB}" "${ORACLE_PWD}"
 log "created"
