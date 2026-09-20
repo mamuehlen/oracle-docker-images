@@ -17,6 +17,14 @@ on:
         description: "Also apply the extensions/patching extension (-p)"
         type: boolean
         default: false
+      regenerate_seed:
+        description: >-
+          (only with patching) Rebuild the dbca seed template at the patched
+          RU level so new containers skip the ~30 min datapatch run at first
+          start. Adds ~45 min to the build. Uncheck to keep the stock 19.3
+          seed. See extensions/patching/README.md.
+        type: boolean
+        default: true
       image_tag:
         description: "Local image name:tag to build, e.g. oracle/database:19.32.0.0-se2"
         required: true
@@ -90,8 +98,14 @@ jobs:
       - name: Build image
         id: build
         working-directory: OracleDatabase/SingleInstance/dockerfiles
+        env:
+          # Build options for the patching *extension* (buildContainerImage.sh
+          # does not forward -o to it - see the comment there). Boolean inputs
+          # are used directly, never compared to 'true' (see CI.md).
+          PATCHING_BUILD_OPTS: ${{ inputs.patching && !inputs.regenerate_seed && '--build-arg REGENERATE_SEED=false' || '' }}
         run: |
           set -euo pipefail
+          echo "PATCHING_BUILD_OPTS='${PATCHING_BUILD_OPTS}'"
           ./buildContainerImage.sh \
             -v "${{ inputs.version }}" \
             ${{ inputs.edition_flag }} \
@@ -129,6 +143,32 @@ jobs:
             echo "::error::Missing expected patch(es):${MISSING} - refusing to push ${{ steps.build.outputs.src_tag }}"
             exit 1
           fi
+
+      # Second safety net, for the regenerated seed: dbca.rsp.tmpl must point
+      # at a template that actually exists in the image, and when
+      # regenerate_seed was requested it must not be the stock one (a silently
+      # skipped seedgen stage would otherwise ship a "fast start" image that
+      # still runs datapatch for 30 minutes).
+      - name: Verify seed template
+        if: inputs.patching
+        env:
+          REGENERATE_SEED: ${{ inputs.regenerate_seed }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint bash -e REGENERATE_SEED="${REGENERATE_SEED}" "${{ steps.build.outputs.src_tag }}" -c '
+            set -euo pipefail
+            T=$ORACLE_HOME/assistants/dbca/templates
+            TPL=$(sed -n "s/^templateName=//p" $ORACLE_BASE/scripts/base/dbca.rsp.tmpl)
+            echo "dbca.rsp.tmpl templateName=${TPL}"
+            [ -f "$T/${TPL}" ] || { echo "::error::template ${TPL} missing in $T"; ls -l $T; exit 1; }
+            if [ "${REGENERATE_SEED}" = "true" ]; then
+              [ "${TPL}" != "General_Purpose.dbc" ] || { echo "::error::regenerate_seed requested but image still uses the stock seed"; exit 1; }
+              [ ! -f "$T/Seed_Database.dfb" ] || { echo "::error::stock Seed_Database.dfb still present"; exit 1; }
+              cat "$T/${TPL%.dbc}.README"
+            else
+              [ "${TPL}" = "General_Purpose.dbc" ] || { echo "::error::regenerate_seed=false but templateName is ${TPL}"; exit 1; }
+            fi
+            ls -l $T | awk "NR>1 {printf \"%8.1f MB  %s\n\", \$5/1048576, \$9}"'
 
       # One-time host setup required before this step works:
       # add "vsdock01.pcsoft.de:5000" to /etc/docker/daemon.json's

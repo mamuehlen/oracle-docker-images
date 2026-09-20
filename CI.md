@@ -57,6 +57,7 @@ second bug so confusing: the push step correctly went looking for the
 | `version` | Version directory under `OracleDatabase/SingleInstance/dockerfiles/`, e.g. `19.3.0`, `23.26.0` |
 | `edition_flag` | `-e` (EE), `-s` (SE2), `-x` (XE), `-f` (Free) |
 | `patching` | `true` to also apply `extensions/patching` (RU/DPBP/OPatch on top of the base install) |
+| `regenerate_seed` | (only with `patching`) `true` (default) rebuilds the dbca seed template at the patched RU level inside the build, so new containers are ready in ~8 min instead of ~35 (no datapatch at first start). Adds ~45 min to the build. `false` keeps the stock 19.3 seed. See `OracleDatabase/SingleInstance/extensions/patching/README.md`, "Seed template regeneration" |
 | `image_tag` | Local tag the image gets built as |
 | `build_arg_overrides` | Optional extra `--build-arg ...` passthrough (rarely needed - see 23.26 example) |
 | `fetch_map` | One `"zft/relative/path/file.zip repo/relative/dest/dir"` pair per line - see below |
@@ -81,6 +82,7 @@ workflow's `-u` is a no-op placeholder for whenever that changes.
   "version": "19.3.0",
   "edition_flag": "-s",
   "patching": true,
+  "regenerate_seed": true,
   "image_tag": "oracle/database:19.32.0.0-se2",
   "build_arg_overrides": "",
   "fetch_map": "ora/Ora19/LINUX.X64_193000_db_home.zip OracleDatabase/SingleInstance/dockerfiles/19.3.0\nora/Ora19/patches/p6880880_190000_LINUX.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs\nora/Ora19/patches/p39657094_1932000DBRU_Generic.zip OracleDatabase/SingleInstance/extensions/patching/patches/one_offs\nora/Ora19/patches/p39472050_190000_Linux-x86-64.zip OracleDatabase/SingleInstance/extensions/patching/patches/release_update",
@@ -93,6 +95,21 @@ To build a *different* RU later: swap the two `patches/` filenames and
 patch numbers in `fetch_map` **and** `expected_patches` for the new
 RU/DPBP zips (upload them to `zft.zedas.com` first, same
 `Ora19/patches/` layout). OPatch (`p6880880`) rarely needs to change.
+The seed template is regenerated from scratch on every build and named
+after the RU it finds (`General_Purpose_1932`, `_1933`, ...), so nothing
+else needs to change for it.
+
+Expect this build to take **~1 h 30 min** on the runner: base install
+~20 min, opatch ~10-30 min, seed regeneration ~40 min (that's the
+19.3→19.32 datapatch run moving from every container's first start into
+the image build - once), plus push. With `regenerate_seed: false` it's
+~45-60 min. The image is ~1 GB larger with the regenerated seed (9.4 vs
+8.4 GB uncompressed) - see the patching README for the breakdown.
+
+`regenerate_seed` is a `type: boolean` input like `patching` - same rule,
+send a real JSON boolean and never compare it to the string `'true'` in
+the workflow (it's used as `inputs.patching && !inputs.regenerate_seed`
+there).
 
 ### 23.26.0 SE2 via the 23.26.3 Gold Image
 
@@ -167,6 +184,33 @@ For a 19.x RU/DPBP build, expect to see the RU and DPBP patch numbers
 from `fetch_map` in the output - if all you see is the base install's
 original RU (e.g. `29517242;Database Release Update : 19.3.0.0.190416`
 for a plain 19.3.0 base), the patching step didn't actually run.
+
+### Seed template
+
+For `patching=true` builds the workflow also runs a **"Verify seed
+template"** step before pushing: `dbca.rsp.tmpl`'s `templateName` must
+exist in `$ORACLE_HOME/assistants/dbca/templates/`, and with
+`regenerate_seed=true` it must be the regenerated one
+(`General_Purpose_<RU>.dbc`, stock `Seed_Database.dfb` gone) - a
+silently skipped `seedgen` stage would otherwise ship an image that
+*looks* like the fast-start variant but still runs datapatch for 30 min
+at first start. The step prints the template's `.README` (the `opatch
+lspatches` the seed was built from) into the job log.
+
+To check an image in the registry by hand:
+
+```bash
+docker run --rm --entrypoint bash vsdock01.pcsoft.de:5000/oracle/database:<tag> -c '
+  grep -E "^(templateName|numberOfPDBs)=" $ORACLE_BASE/scripts/base/dbca.rsp.tmpl
+  cat $ORACLE_HOME/assistants/dbca/templates/General_Purpose_*.README'
+```
+
+And the real proof is a container start: with the regenerated seed
+`DATABASE IS READY TO USE!` appears after ~8 min and the log contains no
+`WITH ERRORS` datapatch pass; the sqlpatch logs under
+`/opt/oracle/cfgtoollogs/sqlpatch/` take ~10 s each. The RMAN compression
+line `CONFIGURE COMPRESSION ALGORITHM 'BASIC'` in the *build* log is the
+SE2 licensing evidence (see the patching README).
 
 ## Known open item
 

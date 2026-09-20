@@ -356,6 +356,12 @@ cat << EOF
 EOF
 
 # EXTEND THE BUILT IMAGE BY APPLYING PATCHING EXTENSION
+# The -o build options above are deliberately NOT forwarded (they carry
+# BASE_IMAGE/INSTALL_FILE_1 for the base build, which would clash with the
+# extension's own --build-arg BASE_IMAGE). Options meant for the patching
+# extension itself go through PATCHING_BUILD_OPTS instead, e.g.
+#   PATCHING_BUILD_OPTS="--build-arg REGENERATE_SEED=false" ./buildContainerImage.sh -v 19.3.0 -s -p
 if [ ${PATCHING} -eq 1 ]; then
-  ../../extensions/buildExtensions.sh -b "${IMAGE_NAME}" -t "${IMAGE_NAME}"-ext -v "${VERSION}" -x 'patching'
+  ../../extensions/buildExtensions.sh -b "${IMAGE_NAME}" -t "${IMAGE_NAME}"-ext -v "${VERSION}" -x 'patching' \
+    ${PATCHING_BUILD_OPTS:+-o "${PATCHING_BUILD_OPTS}"}
 fi

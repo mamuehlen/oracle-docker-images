@@ -59,6 +59,24 @@ RUN rm -rf "$ORACLE_HOME"/apex \
            "$ORACLE_HOME"/suptools
 
 
+## Seed regeneration stage: rebuild the dbca seed template at the RU level
+## just patched into the binaries above, so containers don't spend ~30 min in
+## datapatch on every first start. See regenerateSeedTemplate.sh for the full
+## rationale, the SE2 licensing note (RMAN BASIC compression) and the
+## DBT-10312 consequence handled in createDB.sh. Adds ~45 min to the build.
+## REGENERATE_SEED=false turns this into a no-op (stock seed, datapatch at
+## first start). Like the slim-down above, all the temporary database's
+## files are created *and* deleted inside this stage, so only the template
+## itself reaches the final image via COPY --from below.
+FROM patching as seedgen
+ARG REGENERATE_SEED=true
+ENV REGENERATE_SEED_FILE="regenerateSeedTemplate.sh"
+COPY --chown=oracle:dba $REGENERATE_SEED_FILE $ORACLE_BASE/
+RUN chmod ug+x "$ORACLE_BASE/$REGENERATE_SEED_FILE" && \
+    "$ORACLE_BASE/$REGENERATE_SEED_FILE" "$REGENERATE_SEED" && \
+    rm -f "$ORACLE_BASE/$REGENERATE_SEED_FILE"
+
+
 ## New stage for minimal layer size
 # hadolint ignore=DL3006
 FROM ${BASE_IMAGE}-base
@@ -74,18 +92,37 @@ ENV DATAPATCH_FILE="runDatapatch.sh" \
 USER oracle
 WORKDIR /home/oracle
 
-# Copying patched oracle_base from previous layer (already slimmed down above)
-COPY --from=patching $ORACLE_BASE $ORACLE_BASE
+# Copying patched oracle_base from the seedgen stage (patched, slimmed down,
+# and - unless REGENERATE_SEED=false - with the regenerated seed template)
+COPY --from=seedgen $ORACLE_BASE $ORACLE_BASE
 
-# SE2 licensing safeguard: Oracle Text/JSON Search indexes default to Advanced
-# Index Compression (COMPRESS 2), which isn't licensed under Standard Edition
-# 2. Runs once via the standard user-scripts hook (runOracle.sh calls
-# runUserScripts.sh against $ORACLE_BASE/scripts/setup after database
-# creation) and sets the CTXSYS default storage preference to NOCOMPRESS, so
-# indexes created without an explicit PARAMETERS clause don't silently violate
-# SE2 licensing. Not currently exercised by ZEDAS (no CTXSYS-typed columns in
-# the schema) - purely defensive for if/when Oracle Text ever gets used.
-COPY --chown=oracle:dba se2_ctxsys_nocompress.sql $ORACLE_BASE/scripts/setup/
+# Extension setup hooks, run once after database creation by runOracle.sh via
+# runUserScripts.sh "$ORACLE_BASE/scripts/extensions/setup" (alphabetical order,
+# hence the numeric prefixes). Deliberately NOT /opt/oracle/scripts/setup: that
+# is the user hook, and a user volume mounted there would hide our scripts.
+#   10_seedCreatePDB.sh       - with the regenerated seed (US7ASCII, see
+#                               regenerateSeedTemplate.sh): converts the
+#                               character set to $ORACLE_CHARACTERSET (dbca's
+#                               own INTERNAL_CONVERT sequence, replayed - dbca
+#                               itself only warns DBT-11153 for a CDB clone
+#                               template) and creates $ORACLE_PDB from
+#                               PDB$SEED (dbca can't, DBT-10312). No-op with
+#                               the stock seed.
+#   20_se2LicenseSettings.sh  - CONTROL_MANAGEMENT_PACK_ACCESS=NONE, HEAT_MAP=OFF,
+#                               SQL Tuning Advisor auto task off (EE-only packs).
+#   30_se2CtxsysNocompress.sh - Oracle Text default storage NOCOMPRESS (Advanced
+#                               Index Compression isn't licensed in SE2). A .sh,
+#                               not .sql: needs ALTER SESSION SET CONTAINER to
+#                               $ORACLE_PDB first - a plain "sqlplus / as sysdba"
+#                               (all runUserScripts.sh .sql files get exactly
+#                               that) always lands in CDB$ROOT, where the
+#                               setting is a no-op (found 2026-09-20: this had
+#                               silently never applied to the PDB since this
+#                               extension's very first commit).
+#   savePatchSummary.sh       - upstream: records opatch lspatches for runDatapatch.sh
+COPY --chown=oracle:dba seedCreatePDB.sh    $ORACLE_BASE/scripts/extensions/setup/10_seedCreatePDB.sh
+COPY --chown=oracle:dba se2LicenseSettings.sh $ORACLE_BASE/scripts/extensions/setup/20_se2LicenseSettings.sh
+COPY --chown=oracle:dba --chmod=750 se2_ctxsys_nocompress.sh $ORACLE_BASE/scripts/extensions/setup/30_se2CtxsysNocompress.sh
 
 # Copy script to run datapatch
 COPY --chown=oracle:dba $DATAPATCH_FILE $ORACLE_BASE/scripts/extensions/startup/

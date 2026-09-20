@@ -604,11 +604,18 @@ sqlplus / as sysdba << EOF
 
    DECLARE
      v_cdb VARCHAR2(3);
+     v_pdb NUMBER;
    BEGIN
      SELECT cdb INTO v_cdb FROM v\$database;
 
      IF v_cdb = 'YES' THEN
-       EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE $ORACLE_PDB SAVE STATE';
+       -- The PDB may not exist yet: a CDB clone seed template (see
+       -- extensions/patching) can't create PDBs via dbca; the extension's
+       -- setup hook creates it and runs SAVE STATE itself in that case.
+       SELECT COUNT(*) INTO v_pdb FROM v\$pdbs WHERE name = UPPER('$ORACLE_PDB');
+       IF v_pdb > 0 THEN
+         EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE $ORACLE_PDB SAVE STATE';
+       END IF;
        EXECUTE IMMEDIATE 'GRANT SELECT ON sys.v_\$pdbs TO OPS\$oracle';
        EXECUTE IMMEDIATE 'ALTER USER OPS\$oracle SET container_data=all for sys.v_\$pdbs container = current';
      END IF;
