@@ -467,13 +467,19 @@ start, `startFaststart.sh` just drops the unwanted variant
 one to `$ORACLE_PDB` (`ALTER PLUGGABLE DATABASE ... RENAME GLOBAL_NAME`) -
 both cheap, mostly-metadata operations, seconds not minutes.
 
-**Final measured result, both variants verified end-to-end (2026-09-20):**
-decompress 54s, instance start 34s, variant selection (drop+rename) 5s,
-remaining hooks 3s - **~1:38 min total**, vs. ~8-9 min for the regular
-image (~5.5x faster), with both `ORACLE_CHARACTERSET=AL32UTF8` (default)
-and `WE8ISO8859P15` confirmed working (correct `NLS_CHARACTERSET`, correct
-`$ORACLE_PDB` name, service-name login through the listener both tested
-directly).
+**Final measured result, both variants verified end-to-end (2026-09-20),
+with `tar|xz` packaging:** decompress 54s, instance start 34s, variant
+selection (drop+rename) 5s, remaining hooks 3s - **~1:38 min total**, vs.
+~8-9 min for the regular image (~5.5x faster).
+
+**After switching to solid-mode 7zzs packaging** (see "Compression note"
+below - this actually shipped, not just measured in isolation): decompress
+dropped from 54s to **4s** (~13x faster just for that step), total
+**~49s** - a further ~2x on top of the above, ~10-11x faster than the
+regular image overall. Both `ORACLE_CHARACTERSET=AL32UTF8` (default) and
+`WE8ISO8859P15` re-verified working end-to-end on the 7zzs-packaged image
+(correct `NLS_CHARACTERSET`, correct `$ORACLE_PDB` name, correct PDBs in
+`v$pdbs`).
 
 Bugs found and fixed along the way (all by actually building and running
 the image, not by inspection):
@@ -537,45 +543,47 @@ every datafile header and regenerates redo - likely costs more than the
 `dbca` overhead it would replace, and is more fragile than the cheap
 metadata-only `INTERNAL_CONVERT`.
 
-Compression note (not yet applied - `tar|xz` is still the current
-packaging, see "7z vs xz" above), backed by actual measurements
-(2026-09-20) on the full, correct content set (CDB$ROOT+PDB$SEED, ~3.7GB
-uncompressed - bigger than earlier assumed - plus both ~1.5GB customer
-PDBs, ~6.9GB uncompressed total):
+Compression note - **implemented** (2026-09-20): the archive is now a
+solid-mode `7zzs` archive, not `tar|xz`. Backed by actual measurements on
+the full, correct content set (CDB$ROOT+PDB$SEED, ~3.7GB uncompressed -
+bigger than earlier assumed - plus both ~1.5GB customer PDBs, ~6.9GB
+uncompressed total):
 
 - **Two separate archives** (root+seed duplicated into each, one PDB per
   archive) - the "obvious" alternative to shipping one combined archive -
   came out *larger* overall: 1.1G (root+seed+PDBUTF8) + 819M
-  (root+seed+PDBISO) = **1.92G total**, worse than the current single
-  combined archive (1.4G), because root+seed's ~3.7GB gets compressed
-  twice instead of once. Ruled out.
+  (root+seed+PDBISO) = **1.92G total**, worse than a single combined `xz`
+  archive (1.4G), because root+seed's ~3.7GB gets compressed twice
+  instead of once. Ruled out.
 - `xz -6` gets **zero** cross-copy deduplication between the two customer
   PDBs - compressed separately (315M + 313M) or together (628M) comes out
   identical either way, because its default 8MiB dictionary can't span
   the ~1.5GB distance between the copies.
 - A **solid-mode 7z archive of everything together** (root+seed + both
-  PDBs, one archive) came out at **685M** - less than half the current
-  1.4G, and the earlier worry that per-block SCNs/checksums would defeat
-  deduplication between the two independently-created PDBs turned out to
-  be unfounded (most of each PDB's content is static dictionary data -
-  Java/Spatial/RU BLOB - that's byte-identical between the two).
+  PDBs, one archive) came out at **685M** - less than half the 1.4G `xz`
+  baseline, and the earlier worry that per-block SCNs/checksums would
+  defeat deduplication between the two independently-created PDBs turned
+  out to be unfounded (most of each PDB's content is static dictionary
+  data - Java/Spatial/RU BLOB - that's byte-identical between the two).
 
-**Decompression speed - unresolved, needs a real in-container test**: an
-isolated host-side comparison initially suggested 7z decodes much faster
-than `xz -T0` even under realistic 2-4 core limits (`taskset`), but a
-*separate* attempt to verify the `xz -T0` half of that story by actually
-changing `startFaststart.sh` and rebuilding found **no measurable
-difference** in the real container (~54s either way, before and after).
-The two results contradict each other, and re-checking pointed at
-environment inconsistencies in the host-side benchmarks (some output went
-to a tmpfs-backed `/tmp`, not real disk) rather than a settled answer.
-Testing 7z properly needs the actual static `7zzs` binary gvenzl's project
-uses (a distro `7z` package is dynamically linked against a newer
-libstdc++ than this image ships, and fails to run here) copied into a real
-container - not yet done. Bottom line: the **685M vs 1.4G size result is
-solid** (measured directly, reproducible), but no decompression-speed
-number here should be trusted until it's re-measured end-to-end in an
-actual container, the same way the ~1:38 min total above was.
+**Decompression speed - resolved, measured end-to-end in the real image**
+(a host-side-only comparison had been unreliable earlier - see git history
+- some benchmark output went to a tmpfs-backed `/tmp` instead of real
+disk, giving misleadingly large numbers either way; this is the real,
+final, in-container result that superseded it): decompressing the archive
+dropped from **54s** (`tar|xz`) to **4s** (`7zzs x`) - both variants
+re-verified working correctly afterward. `7zzs` is the official 7-Zip
+project's single-file, fully static Linux binary
+(`github.com/ip7z/7zip` releases - confirmed with `ldd`/`file`, no shared-
+library dependencies at all) - the same binary gvenzl/oci-oracle-free uses
+for the identical purpose. A distro `p7zip` package isn't an option
+(not in Oracle Linux's default repos, would need EPEL), and a dynamically-
+linked `7z` copied in from a non-Oracle-Linux host fails here with a
+glibc/libstdc++ ABI mismatch (`CXXABI_1.3.15' not found`) - confirmed by
+testing, not assumed. See the `Dockerfile`'s `sevenzip` build stage for
+the download+checksum-pinned install (`SEVENZIP_VERSION`/
+`SEVENZIP_SHA256` build args - no official checksum file is published
+upstream, so the hash is computed once per version bump and hardcoded).
 
 `startFaststart.sh`'s actual variant-selection logic (implemented) - the
 rename requires the PDB to be open in RESTRICTED mode first, a plain OPEN

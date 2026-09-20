@@ -52,7 +52,7 @@ export ORACLE_PWD="${ORACLE_PWD:-Welcome1}"
 export ORACLE_CHARACTERSET=US7ASCII
 PDB_ISO=PDBISO
 PDB_UTF8=PDBUTF8
-ARCHIVE="${ORACLE_BASE}/faststart-oradata.tar.xz"
+ARCHIVE="${ORACLE_BASE}/faststart-oradata.7z"
 
 log() { echo "[$(date -u +%H:%M:%SZ)] faststart-build: $*"; }
 
@@ -400,11 +400,16 @@ lsnrctl stop >/dev/null 2>&1 || true
 # ---------------------------------------------------------------------------
 # 6. Compress oradata (everything needed to restore: datafiles under
 #    oradata/<SID>/, plus the config files just consolidated into
-#    oradata/dbconfig/<SID>/) with xz - LZMA2, already present in the base
-#    image, no extra package needed.
+#    oradata/dbconfig/<SID>/) with 7zzs in solid mode - measured
+#    (2026-09-20) at 685M for this content vs. 1.4G via `tar|xz`: LZMA2 in
+#    solid mode finds the heavy redundancy between the two customer-PDB
+#    variants (each a clone of the same PDB$SEED) that xz's small default
+#    dictionary can't reach across. See ../patching/README.md's faststart
+#    section, "Compression note", for the measurement and the two
+#    alternatives it ruled out (two separate archives; plain xz).
 # ---------------------------------------------------------------------------
 log "compressing oradata..."
-tar -C "${ORACLE_BASE}" -cf - oradata | xz -T0 -6 > "${ARCHIVE}"
+(cd "${ORACLE_BASE}" && 7zzs a -mx=6 -ms=on -mmt=on "${ARCHIVE}" oradata >/dev/null)
 log "archive size: $(du -h "${ARCHIVE}" | cut -f1)"
 
 # Raw oradata is now redundant - remove it so only the archive ends up in

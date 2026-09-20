@@ -21,9 +21,36 @@
 #     -t oracle/database:19.32.0.0-se2-faststart -x 'faststart'
 
 ARG BASE_IMAGE=oracle/database:19.32.0.0-se2-ext
+
+# 7zzs: the official 7-Zip project's single-file, fully static Linux
+# binary (github.com/ip7z/7zip releases - no shared-library dependencies
+# at all, verified with `ldd` and `file`). Used instead of tar|xz for the
+# faststart archive: measured (2026-09-20) at 685M solid-compressed for
+# CDB$ROOT+PDB$SEED+both customer-PDB variants together, vs. 1.4G for the
+# same content via `tar|xz` - LZMA2 in solid mode finds heavy cross-PDB
+# redundancy that xz's small default dictionary can't reach. Needed in
+# BOTH stages below: the builder stage to CREATE the archive, the final
+# stage to EXTRACT it at container start (startFaststart.sh). A distro
+# `p7zip` package isn't an option (not in Oracle Linux's default repos,
+# would need EPEL), and the dynamically-linked p7zip from a non-Oracle-
+# Linux host fails here with a glibc/libstdc++ ABI mismatch
+# (`CXXABI_1.3.15' not found`) - 7zzs's static linking is exactly why
+# gvenzl/oci-oracle-free uses the same binary for the same purpose.
+FROM oraclelinux:9 AS sevenzip
+ARG SEVENZIP_VERSION=26.03
+ARG SEVENZIP_SHA256=dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695
+RUN set -eux; \
+    dnf install -y xz; \
+    mkdir -p /tmp/7z && cd /tmp/7z; \
+    curl -fsSL -O "https://github.com/ip7z/7zip/releases/download/${SEVENZIP_VERSION}/7z$(echo "${SEVENZIP_VERSION}" | tr -d .)-linux-x64.tar.xz"; \
+    echo "${SEVENZIP_SHA256}  7z$(echo "${SEVENZIP_VERSION}" | tr -d .)-linux-x64.tar.xz" | sha256sum -c -; \
+    tar xf 7z*.tar.xz 7zzs License.txt; \
+    chmod 755 7zzs
+
 # hadolint ignore=DL3006
 FROM ${BASE_IMAGE} AS builder
 
+COPY --from=sevenzip /tmp/7z/7zzs /usr/bin/7zzs
 COPY --chown=oracle:dba buildFaststart.sh "$ORACLE_BASE"/
 RUN chmod ug+x "$ORACLE_BASE"/buildFaststart.sh && \
     sync && \
@@ -54,7 +81,9 @@ RUN rm -f "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dbc \
           "$ORACLE_BASE"/scripts/base/createDB.sh && \
     find "$ORACLE_HOME"/sqlpatch -mindepth 3 -maxdepth 3 -iname '*.zip' -delete
 
-COPY --from=builder --chown=oracle:dba /opt/oracle/faststart-oradata.tar.xz "$ORACLE_BASE"/
+COPY --from=sevenzip /tmp/7z/7zzs /usr/bin/7zzs
+COPY --from=sevenzip /tmp/7z/License.txt /usr/share/licenses/7zip/License.txt
+COPY --from=builder --chown=oracle:dba /opt/oracle/faststart-oradata.7z "$ORACLE_BASE"/
 COPY --chown=oracle:dba startFaststart.sh "$ORACLE_BASE"/scripts/base/
 RUN chmod ug+x "$ORACLE_BASE"/scripts/base/startFaststart.sh && sync
 

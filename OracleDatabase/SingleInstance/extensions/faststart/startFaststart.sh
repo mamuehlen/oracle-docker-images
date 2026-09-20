@@ -31,23 +31,18 @@ export ORACLE_PDB=${ORACLE_PDB^^}
 export ORACLE_CHARACTERSET=${ORACLE_CHARACTERSET:-AL32UTF8}
 export ORACLE_CHARACTERSET=${ORACLE_CHARACTERSET^^}
 
-ARCHIVE="${ORACLE_BASE}/faststart-oradata.tar.xz"
+ARCHIVE="${ORACLE_BASE}/faststart-oradata.7z"
 
 log() { echo "[$(date -u +%H:%M:%SZ)] faststart: $*"; }
 
-# `tar -xJf` shells out to plain `xz -d`, single-threaded regardless of how
-# the archive was compressed. The archive was built with `xz -T0` (multiple
-# independent blocks), so decoding CAN be parallelized too, and explicitly
-# piping through `xz -T0 -dc | tar -x` costs nothing to try - but measured
-# (2026-09-20) end-to-end in a real container, it made no measurable
-# difference (~54s either way): an isolated host-side benchmark had
-# suggested a large win, but that benchmark wrote its output to a tmpfs
-# (RAM-backed /tmp), not real disk - not representative of this step's
-# actual bottleneck. Left in since it's free and doesn't regress anything,
-# but don't expect it to matter; see README's faststart section for the
-# still-open question of what the real bottleneck is here.
+# 7zzs (static, no shared-library deps - see Dockerfile) instead of
+# tar|xz: the archive is a solid 7z archive covering CDB$ROOT+PDB$SEED and
+# both customer-PDB variants together (685M vs. 1.4G for the same content
+# via `tar|xz` - see ../patching/README.md's faststart section,
+# "Compression note"). `-o"${ORACLE_BASE}"` extracts with paths relative
+# to that directory, same as `tar -C "${ORACLE_BASE}" -x` did.
 log "decompressing database..."
-xz -T0 -dc "${ARCHIVE}" | tar -C "${ORACLE_BASE}" -x
+7zzs x "${ARCHIVE}" -o"${ORACLE_BASE}" -y >/dev/null
 log "decompressed"
 
 # Restore symlinks the same way runOracle.sh's symLinkFiles() does - the
