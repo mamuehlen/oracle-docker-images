@@ -86,6 +86,30 @@ export ALLOCATED_MEMORY=$((memory/1024/1024))
 # already have it set right.
 sed -i -e 's|^numberOfPDBs=.*|numberOfPDBs=0|' "${SCRIPT_BASE_DIR}/dbca.rsp.tmpl"
 
+# 23.26.0's createDB.sh (only - 19.3.0's never had this) unconditionally
+# passes -createListener LISTENER:1521 to dbca, which makes dbca invoke
+# netca to auto-configure that listener. netca resolves its own hostname to
+# pick a bind address - works in a real container and in local
+# `podman build` RUN steps (both give their own hostname a resolvable
+# /etc/hosts entry), but not in a GitHub Actions self-hosted runner's
+# BuildKit (`docker buildx`) RUN steps: their ephemeral sandbox hostname
+# ("buildkitsandbox") has none, so netca fails with "No valid IP Address
+# returned for the host buildkitsandbox". Two workarounds were tried and
+# both failed, confirmed by testing against real CI runs (2026-09-20):
+# pre-starting our own listener first (dbca then refuses outright -
+# "DBT-07503: A listener with name (LISTENER) already exists"), and
+# `docker build --add-host` (doesn't reach BuildKit's RUN sandbox, only the
+# final image's runtime config - same netca failure either way). Only
+# remaining option: don't ask dbca to create a listener at all, exactly
+# like extensions/patching/regenerateSeedTemplate.sh's own raw dbca call
+# already does for the same underlying reason - patch our copy of the
+# vendor createDB.sh to drop the flag before running it (a harmless no-op
+# on 19.3.0's createDB.sh, which never had it). The real container's own
+# listener startup at container start is a separate, untouched runtime
+# step (see startFaststart.sh) - this only affects the throwaway instance
+# used to build the snapshot.
+sed -i -E 's/-createListener LISTENER:[0-9]+ //' "${SCRIPT_BASE_DIR}/${CREATE_DB_FILE}"
+
 log "creating CDB\$ROOT + PDB\$SEED via createDB.sh..."
 "${SCRIPT_BASE_DIR}/${CREATE_DB_FILE}" "${ORACLE_SID}" "${ORACLE_PDB}" "${ORACLE_PWD}"
 log "created"
