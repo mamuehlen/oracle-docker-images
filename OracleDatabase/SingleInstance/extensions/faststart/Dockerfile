@@ -130,6 +130,27 @@ COPY --from=builder "$ORACLE_BASE" "$ORACLE_BASE"
 COPY --chown=oracle:dba startFaststart.sh "$ORACLE_BASE"/scripts/base/
 RUN chmod ug+x "$ORACLE_BASE"/scripts/base/startFaststart.sh && sync
 
+# Same two upstream hooks extensions/patching/Dockerfile installs
+# (unmodified copies, not our own code - see that Dockerfile's own comment
+# for what each does), copied here directly rather than referenced across
+# extensions (buildExtensions.sh gives each extension its own directory as
+# build context, so `../patching/...` isn't reachable from here). Installed
+# unconditionally - regardless of whether BASE_IMAGE came from
+# extensions/patching (already has them; this is a harmless identical
+# overwrite) or a Gold Image built with patching=false (never had them
+# before this): startFaststart.sh's persistence support (see
+# ../patching/README.md's "Persistence and datapatch" section) needs
+# runDatapatch.sh to actually be present to have anything to call.
+# BASE_IMAGE_LEAN has none of this either way - the base stage never had
+# it - so it's added here, not inherited.
+ENV DATAPATCH_FILE="runDatapatch.sh" \
+    LSPATCHES_FILE="savePatchSummary.sh" \
+    SKIP_DATAPATCH=false
+COPY --chown=oracle:dba runDatapatch.sh "$ORACLE_BASE"/scripts/extensions/startup/
+COPY --chown=oracle:dba savePatchSummary.sh "$ORACLE_BASE"/scripts/extensions/setup/
+RUN chmod ug+x "$ORACLE_BASE"/scripts/extensions/startup/*.sh \
+               "$ORACLE_BASE"/scripts/extensions/setup/*.sh && sync
+
 # extensions/patching/Dockerfile re-runs these two after its own analogous
 # COPY --from=<flattened stage> onto a lean base - mirrored here rather
 # than assumed unnecessary, since this is the same "recopy a patched
