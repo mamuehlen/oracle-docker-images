@@ -507,6 +507,21 @@ version) - smaller than `-ext` itself (9.4GB) despite carrying a complete
 doesn't need. Both character-set variants re-verified working end-to-end
 on this rebuilt image too.
 
+**Further size breakdown against `container-registry.oracle.com/database/
+enterprise:latest`** (23.26.0, `du`-measured inside each image, 2026-09-20)
+found one more real saving: this image's `$ORACLE_HOME/sqlpatch` was 688M
+against Enterprise's 157M, and the `-iname '*.zip' -delete` above had
+*never actually matched anything* - there is no sqlpatch zip in this
+layout, that line was always a no-op. The real weight was three
+`rollback_files/` directories (686M total, 669M from the main 19.32 RU
+alone) - full unzipped per-RU/bug rollback SQL/PLB trees that
+`datapatch -rollback` would use, moot here since this image's database is
+a fixed, one-shot state that never runs datapatch (or any patch rollback)
+at all. Added `find "$ORACLE_HOME"/sqlpatch -type d -name rollback_files
+-exec rm -rf {} +` next to the (still harmless, still a no-op) zip-delete
+line. Result: **8.13GB**. Both variants re-verified working end-to-end
+again after this change too.
+
 Bugs found and fixed along the way (all by actually building and running
 the image, not by inspection):
 - `buildFaststart.sh` calls `createDB.sh` directly, bypassing

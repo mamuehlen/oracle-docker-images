@@ -79,19 +79,23 @@ RUN chmod ug+x "$ORACLE_BASE"/buildFaststart.sh && \
 # This image never calls dbca -createDatabase or datapatch again, so none
 # of the following is needed at runtime: the ~1.1GB regenerated seed
 # template (its one and only use already happened, just above), the base
-# image's createDB.sh, and the ~250MB per-RU sqlpatch zip datapatch keeps
-# around for a future re-run against an existing volume (this image's
-# database is a fixed, one-shot state, not a persistent volume that gets
-# independently re-patched). Removed HERE, inside the builder stage
-# itself, not in the final stage - see BASE_IMAGE_LEAN's comment above for
-# why that distinction is exactly what makes this actually shrink the
-# final image instead of just whiting the files out.
+# image's createDB.sh, any per-RU sqlpatch zip (there wasn't actually one
+# present - the `-iname '*.zip' -delete` below was always a no-op, checked
+# 2026-09-20), and each RU/bug directory's `rollback_files/` (686MB across
+# the 3 present here, 669MB of it from the main 19.32 RU alone) - datapatch's
+# own rollback mechanism, moot since this image's database is a fixed,
+# one-shot state that never gets re-patched or rolled back. Removed HERE,
+# inside the builder stage itself, not in the final stage - see
+# BASE_IMAGE_LEAN's comment above for why that distinction is exactly what
+# makes this actually shrink the final image instead of just whiting the
+# files out.
 RUN rm -f "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dbc \
           "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.ctl \
           "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dfb* \
           "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.README \
           "$ORACLE_BASE"/scripts/base/createDB.sh && \
-    find "$ORACLE_HOME"/sqlpatch -mindepth 3 -maxdepth 3 -iname '*.zip' -delete
+    find "$ORACLE_HOME"/sqlpatch -mindepth 3 -maxdepth 3 -iname '*.zip' -delete && \
+    find "$ORACLE_HOME"/sqlpatch -type d -name rollback_files -exec rm -rf {} +
 
 ## Final stage: starts from the lean, pre-patching sibling (see
 ## BASE_IMAGE_LEAN above) and copies the builder stage's already-slimmed
