@@ -257,6 +257,46 @@ direction. Mixed character sets inside one CDB would also be architecturally
 possible - Oracle allows it when CDB$ROOT is AL32UTF8 - but are not needed
 here, since each container only ever creates the one customer PDB.)
 
+### The other half of "the character set is right": client-side NLS_LANG
+
+Everything above is about the *database's* character set
+(`ORACLE_CHARACTERSET`, what CDB$ROOT/PDB$SEED/the PDB actually store). It
+says nothing about what a *client* connecting to that PDB assumes - and by
+default, this image (like the stock one) sets neither `NLS_LANG` nor a
+usable OS locale:
+
+    LANG=            (empty - everything falls back to POSIX)
+    NLS_LANG         not set anywhere (image env, .bashrc, profile)
+
+When `NLS_LANG` is unset, Oracle client libraries (sqlplus, JDBC without
+its own explicit charset config, etc.) default to `AMERICAN_AMERICA.
+US7ASCII`. For pure-ASCII data this is harmless (US7ASCII is a subset of
+everything). The moment non-ASCII text is involved - German umlauts, `€`,
+anything outside 7-bit ASCII - a client stuck on that US7ASCII default
+will silently mangle it on the way in or out (typically to `?` or garbled
+multi-byte sequences), **even though the database itself is correctly at
+AL32UTF8 or WE8ISO8859P15**. This is not something this image's seed work
+introduced - the stock image has the identical gap - but it is exactly the
+kind of silent failure the rest of this document worked hard to eliminate
+on the server side, so it is worth calling out explicitly here rather than
+assuming it is someone else's problem.
+
+There is no single correct default to bake into the image: which
+`NLS_LANG` is "right" depends on the connecting application's own target
+character set (an AL32UTF8 consumer wants a different value than a
+WE8ISO8859P15 one), which this image cannot know in advance. So: whoever
+connects - an application's JDBC/OCI configuration, or a human running
+`sqlplus` inside the container for troubleshooting - needs to set
+`NLS_LANG` themselves, matching the PDB's actual character set, e.g.
+
+    NLS_LANG=GERMAN_GERMANY.AL32UTF8        # for an AL32UTF8 PDB
+    NLS_LANG=GERMAN_GERMANY.WE8ISO8859P15   # for a WE8ISO8859P15 PDB (ASSET)
+
+(the territory/language part before the dot only affects things like date
+formats and error-message language, not correctness of the character
+data - it is the part after the dot, matching the DB's `NLS_CHARACTERSET`,
+that actually matters here).
+
 ### DBT-10312: the PDB is created by the setup hook, not by dbca
 
 A clone template made from a CDB carries a `<PluggableDatabases>` element.
