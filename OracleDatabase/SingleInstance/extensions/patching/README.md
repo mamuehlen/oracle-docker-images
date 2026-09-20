@@ -481,6 +481,32 @@ regular image overall. Both `ORACLE_CHARACTERSET=AL32UTF8` (default) and
 (correct `NLS_CHARACTERSET`, correct `$ORACLE_PDB` name, correct PDBs in
 `v$pdbs`).
 
+**Image size, after also fixing the whiteout problem** (2026-09-20): the
+final stage used to `FROM ${BASE_IMAGE}` (the patched+seeded `-ext` image,
+1.1GB regenerated seed template + ~250MB sqlpatch zips included) and `rm`
+what it didn't need - which only whites those files out, since `rm` in a
+later layer can't shrink bytes physically present in an inherited,
+already-published lower layer (confirmed: image size didn't budge with
+that approach). Fixed the same way `../patching/Dockerfile` fixes the
+analogous problem for its own final stage: the faststart final stage now
+starts `FROM ${BASE_IMAGE_LEAN}` (`oracle/database:19.32.0.0-se2-base` -
+the pre-patching, pre-seed sibling, confirmed to still exist locally and
+verified to be missing only 8 patching-specific ENV vars that nothing
+this image runs actually references) instead, and `COPY --from=builder`
+pulls in the builder stage's *already-slimmed* `$ORACLE_BASE` (the
+template/sqlpatch/createDB.sh removal now happens inside the builder
+stage itself, right after the archive is built) - `COPY --from=<stage>`
+copies that stage's resolved filesystem view, not raw layers, so this
+actually drops the bytes instead of just hiding them. Also re-runs
+`orainstRoot.sh`/`root.sh` after the copy, mirroring what the patching
+Dockerfile does for the identical "recopy a patched ORACLE_HOME onto a
+pristine base" operation. Result: **8.82GB**, down from 10.1GB (7zzs
+packaging alone, whiteout still present) and 10.8GB (original `tar|xz`
+version) - smaller than `-ext` itself (9.4GB) despite carrying a complete
+689MB prebuilt database, since it no longer carries the 1.1GB+250MB it
+doesn't need. Both character-set variants re-verified working end-to-end
+on this rebuilt image too.
+
 Bugs found and fixed along the way (all by actually building and running
 the image, not by inspection):
 - `buildFaststart.sh` calls `createDB.sh` directly, bypassing

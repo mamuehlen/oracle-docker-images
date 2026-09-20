@@ -21,6 +21,25 @@
 #     -t oracle/database:19.32.0.0-se2-faststart -x 'faststart'
 
 ARG BASE_IMAGE=oracle/database:19.32.0.0-se2-ext
+# The lean, pre-patching/pre-seed sibling of BASE_IMAGE - same trick
+# extensions/patching/Dockerfile uses for its own final stage
+# (`FROM ${BASE_IMAGE}-base`). Needed because `rm` in a stage FROM'd
+# directly off BASE_IMAGE only whites out files that physically remain in
+# BASE_IMAGE's own already-published layers (confirmed by testing: image
+# size didn't shrink at all that way). `COPY --from=<stage>` instead
+# copies the *resolved filesystem view* of that stage, not raw layers -
+# so starting the final stage from a genuinely lean, separate image and
+# copying the already-slimmed builder stage's content onto it actually
+# shrinks the result. Confirmed safe to use directly (no re-declared
+# ENV vars needed): diffing this image's `docker inspect .Config.Env`
+# against BASE_IMAGE's shows exactly 8 patching-specific vars missing
+# (CHECK_DB_LOCK_FILE, DATAPATCH_FILE, LOCKING_SCRIPT, LSPATCHES_FILE,
+# SHUT_DB_FILE, SKIP_DATAPATCH, STARTUP_FILE, SWAP_LOCK_FILE) - none of
+# which any script this image actually runs at build or runtime
+# references (`grep`-checked; savePatchSummary.sh, the one hook whose
+# name matches LSPATCHES_FILE, sets its own local variable of the same
+# name and never reads the environment one).
+ARG BASE_IMAGE_LEAN=oracle/database:19.32.0.0-se2-base
 
 # 7zzs: the official 7-Zip project's single-file, fully static Linux
 # binary (github.com/ip7z/7zip releases - no shared-library dependencies
@@ -57,23 +76,16 @@ RUN chmod ug+x "$ORACLE_BASE"/buildFaststart.sh && \
     "$ORACLE_BASE"/buildFaststart.sh && \
     rm -f "$ORACLE_BASE"/buildFaststart.sh
 
-## Final stage: the seed template and creation-only script are no longer
-## needed - this image never calls dbca -createDatabase again.
-# hadolint ignore=DL3006
-FROM ${BASE_IMAGE}
-
 # This image never calls dbca -createDatabase or datapatch again, so none
 # of the following is needed at runtime: the ~1.1GB regenerated seed
-# template (its one and only use already happened, in the builder stage
-# above), the base image's createDB.sh, and the ~250MB per-RU sqlpatch zip
-# datapatch keeps around for a future re-run against an existing volume
-# (this image's database is a fixed, one-shot state, not a persistent
-# volume that gets independently re-patched).
-#
-# IMPORTANT: this only actually shrinks the image when built with
-# `--squash-all` (buildExtensions.sh: `-o '--squash-all'`) - `rm` alone in
-# this stage only whites out files that physically remain in the inherited
-# base image's own (already-published) layers; see README for why.
+# template (its one and only use already happened, just above), the base
+# image's createDB.sh, and the ~250MB per-RU sqlpatch zip datapatch keeps
+# around for a future re-run against an existing volume (this image's
+# database is a fixed, one-shot state, not a persistent volume that gets
+# independently re-patched). Removed HERE, inside the builder stage
+# itself, not in the final stage - see BASE_IMAGE_LEAN's comment above for
+# why that distinction is exactly what makes this actually shrink the
+# final image instead of just whiting the files out.
 RUN rm -f "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dbc \
           "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.ctl \
           "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dfb* \
@@ -81,11 +93,34 @@ RUN rm -f "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dbc \
           "$ORACLE_BASE"/scripts/base/createDB.sh && \
     find "$ORACLE_HOME"/sqlpatch -mindepth 3 -maxdepth 3 -iname '*.zip' -delete
 
+## Final stage: starts from the lean, pre-patching sibling (see
+## BASE_IMAGE_LEAN above) and copies the builder stage's already-slimmed
+## $ORACLE_BASE onto it in one fresh layer - this is what actually
+## shrinks the image, not the `rm` above by itself.
+# hadolint ignore=DL3006
+FROM ${BASE_IMAGE_LEAN}
+
+# BASE_IMAGE_LEAN has no USER set (defaults to root, WORKDIR /) - BASE_IMAGE
+# (-ext) sets these explicitly, so this stage needs to as well (confirmed
+# by testing: `docker inspect .Config.User` is empty on the lean image,
+# "oracle" on -ext).
+USER oracle
+WORKDIR /home/oracle
+
 COPY --from=sevenzip /tmp/7z/7zzs /usr/bin/7zzs
 COPY --from=sevenzip /tmp/7z/License.txt /usr/share/licenses/7zip/License.txt
-COPY --from=builder --chown=oracle:dba /opt/oracle/faststart-oradata.7z "$ORACLE_BASE"/
+COPY --from=builder "$ORACLE_BASE" "$ORACLE_BASE"
 COPY --chown=oracle:dba startFaststart.sh "$ORACLE_BASE"/scripts/base/
 RUN chmod ug+x "$ORACLE_BASE"/scripts/base/startFaststart.sh && sync
+
+# extensions/patching/Dockerfile re-runs these two after its own analogous
+# COPY --from=<flattened stage> onto a lean base - mirrored here rather
+# than assumed unnecessary, since this is the same "recopy a patched
+# ORACLE_HOME onto a pristine base" operation, just one level up.
+USER root
+RUN "$ORACLE_BASE"/oraInventory/orainstRoot.sh && \
+    "$ORACLE_HOME"/root.sh
+USER oracle
 
 HEALTHCHECK --interval=1m --start-period=2m --timeout=30s \
    CMD $ORACLE_BASE/$CHECK_DB_FILE >/dev/null || exit 1
