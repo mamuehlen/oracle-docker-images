@@ -333,22 +333,75 @@ the hook is a no-op, as it is for `NON_CDB=true`.
 
 #### Build sequencing for the dual-charset faststart design
 
-Root must end up AL32UTF8 - not just preference, Oracle enforces it: a PDB
-can only be opened/plugged into a root whose character set is a superset
-of the PDB's. So `INTERNAL_CONVERT` order matters, since it only works
-subset->superset:
+Three things learned the hard way (2026-09-20, by actually running each
+approach and reading the resulting `ORA-` error) rule out every "obvious"
+sequencing:
 
-1. build the throwaway CDB in US7ASCII (as today)
-2. clone the WE8ISO8859P15-target PDB from the *still-US7ASCII* PDB$SEED
-   first, then convert *that PDB* to WE8ISO8859P15 - valid (US7ASCII is a
-   subset of WE8ISO8859P15)
-3. only *afterwards* convert CDB$ROOT + PDB$SEED themselves to AL32UTF8
-4. clone the AL32UTF8-target PDB from the now-AL32UTF8 PDB$SEED - no
-   conversion needed, it already matches
+1. `ALTER DATABASE CHARACTER SET INTERNAL_CONVERT` only works against
+   `CDB$ROOT`+`PDB$SEED` themselves - the exact sequence dbca uses for its
+   own stock seed (see "Character sets" above). Running it against an
+   already-created ordinary PDB (e.g. clone a PDB from PDB$SEED first,
+   then try to convert *that PDB*) fails hard with `ORA-12715: invalid
+   character set specified`, even though the charset name itself is valid
+   (`v$nls_valid_values` lists it). Confirmed independently by
+   mikedietrichde.com ("Can you select a PDB's character set?"): the only
+   supported way to give a PDB a non-default character set is to clone it
+   from an already-differently-charset `PDB$SEED`, never to convert the
+   clone afterward.
+2. `INTERNAL_CONVERT`'s subset/superset check is about **binary
+   byte-encoding compatibility**, not abstract character-repertoire
+   coverage. `WE8ISO8859P15 -> AL32UTF8` fails with `ORA-12712: new
+   character set must be a superset of old character set`, even though
+   Unicode obviously covers every ISO-8859-15 character - because
+   ISO-8859-15's high bytes (0x80-0xFF) aren't encoded as the same bytes
+   AL32UTF8 (UTF-8) would use for those characters. Only `US7ASCII` is a
+   true binary subset of *every* other Oracle character set (byte values
+   0-127 are identical everywhere), so it's the only safe common starting
+   point - but that also means the two target variants **cannot be
+   produced by chaining** one conversion after the other; both must start
+   from `US7ASCII` independently.
+3. So: since converting `CDB$ROOT`+`PDB$SEED` a second time from a
+   different starting point isn't an option, get back to the *same*
+   `US7ASCII` starting point twice via a filesystem-level snapshot/restore
+   instead of a second `dbca -createDatabase` run (saves ~7-8 min of
+   RMAN-restore time, and both variants end up derived from byte-identical
+   source data, which matters for compression below):
 
-Converting root to AL32UTF8 *before* branching off the ISO PDB would break
-step 2 (AL32UTF8 -> WE8ISO8859P15 is the forbidden superset->subset
-direction - the same DBT-11153 condition dbca itself warns about).
+       1. dbca creates the throwaway CDB in US7ASCII (as today)
+       2. shut down; `cp -a` the whole oradata/<SID>/ tree aside (root+seed
+          only - no PDBs exist yet at this point)
+       3. start up; convert CDB$ROOT+PDB$SEED to WE8ISO8859P15; clone the
+          ISO-variant PDB from the now-ISO PDB$SEED
+       4. `ALTER PLUGGABLE DATABASE <iso> UNPLUG INTO '<xml>'` - keeps its
+          datafiles on disk, just drops the dictionary entry
+       5. shut down; delete everything in oradata/<SID>/ EXCEPT the ISO
+          PDB's own subdirectory; restore the step-2 snapshot over it -
+          CDB$ROOT+PDB$SEED are back to pristine US7ASCII, the unplugged
+          ISO PDB's files sit untouched alongside them
+       6. start up; convert CDB$ROOT+PDB$SEED to AL32UTF8 (valid: US7ASCII
+          is a subset of AL32UTF8 too); clone the UTF8-variant PDB from the
+          now-AL32UTF8 PDB$SEED
+       7. `CREATE PLUGGABLE DATABASE <iso> USING '<xml>' NOCOPY TEMPFILE
+          REUSE` - plugs the ISO PDB back in. `TEMPFILE REUSE` is required:
+          UNPLUG doesn't preserve temp files (no persistent data in them),
+          so PLUG IN always tries to create a fresh one, but the ISO PDB's
+          own old tempfile is still sitting at that exact path (step 5
+          deliberately left its subdirectory alone) - a plain `CREATE`
+          fails with `ORA-27038: created file already exists` /
+          `ORA-01119` without the `REUSE` clause.
+
+   Root ends up AL32UTF8 either way - not just preference, Oracle enforces
+   it: a CDB can only hold PDBs with a character set different from root's
+   own if root itself is AL32UTF8 (checked during the step-7 plug-in's
+   compatibility validation).
+
+Also found by testing: `ALTER SYSTEM ENABLE RESTRICTED SESSION` only
+blocks *new* connections - `INTERNAL_CONVERT` itself additionally requires
+*zero* other sessions connected at all (`ORA-12721`), and dbca/createDB.sh
+can leave a lingering session behind for a moment right after returning
+control. The build script kills every non-background, non-self session
+before each conversion attempt and retries a few times if `ORA-12721`
+still shows up.
 
 7z vs xz for the archive: same core algorithm (LZMA/LZMA2), so no
 meaningful compression difference. 7z is a real multi-file archive with
@@ -378,25 +431,101 @@ Deliberately **not** in `/opt/oracle/scripts/setup`: that is the *user* hook
 (`-v mydir:/opt/oracle/scripts/setup`), and a user volume mounted there
 would hide our scripts.
 
-### Possible future step: a "faststart" CI variant (not implemented)
+### "faststart" CI variant (implemented, `../faststart/`)
 
-Measured (build 5): of the ~8.5-9 min container start, `dbca`'s own restore+
-completion machinery accounts for ~7:15 (RMAN restore 2:09, instance start
-2:06, "Completing Database Creation" 2:53, post-config ~7s) - `datapatch`
-itself is down to ~10-20s and our own hooks (charset conversion + PDB
-creation + SE2 settings) add ~1:15-1:40. So `dbca` itself, not patching, is
-now the dominant cost, and "Completing Database Creation" - which re-runs
-`catcon`-based completion/validation SQL against the restored template on
-*every* container start, even though the seed's content never changes - is
-the biggest single piece of it.
+Measured (build 5, the regular image): of the ~8.5-9 min container start,
+`dbca`'s own restore+completion machinery accounts for ~7:15 (RMAN restore
+2:09, instance start 2:06, "Completing Database Creation" 2:53, post-config
+~7s) - `datapatch` itself is down to ~10-20s and our own hooks (charset
+conversion + PDB creation + SE2 settings) add ~1:15-1:40. So `dbca` itself,
+not patching, is the dominant cost, and "Completing Database Creation" -
+which re-runs `catcon`-based completion/validation SQL against the restored
+template on *every* container start, even though the seed's content never
+changes - is the biggest single piece of it.
 
-A `gvenzl/oci-oracle-free`-style `-faststart` variant (ship a *fully
-completed* CDB$ROOT+PDB$SEED, already past all completion/validation SQL,
-as a 7z archive; at container start just decompress + `startup`, no
-`dbca -createDatabase` at all) would skip most of that phase. The character-
-set trick (US7ASCII seed + `INTERNAL_CONVERT` before the customer PDB is
-created) still works unchanged in that model - it's independent of whether
-the seed is a dbca *template* (current approach) or an already-created CDB.
+The `faststart` extension (`../faststart/`) ships a *fully completed*
+CDB$ROOT+PDB$SEED, already past all completion/validation SQL, as an xz
+archive; at container start it just decompresses + `startup`s, no
+`dbca -createDatabase` at all. First version deferred the character-set
+conversion itself to container start too (reusing `10_seedCreatePDB.sh`
+unchanged) - measured at ~1:17 min total container start, a huge win. But
+that number turned out to be measuring a no-op: a separate bug (see below)
+meant the archived database was already AL32UTF8 at build time, so the
+"runtime conversion" never actually ran. Once fixed, the **real**
+`INTERNAL_CONVERT US7ASCII -> AL32UTF8` cost was measured at **~5:40 min by
+itself** - it scans the whole ~1.9GB CDB$ROOT+PDB$SEED dictionary (RU BLOB,
+Java, Spatial - see "What's in the seed" above) column by column, even
+though the actual content is pure ASCII needing no byte remapping. That
+swallowed almost all of the time faststart otherwise saves.
+
+Fix: since only two character sets are ever needed in practice
+(AL32UTF8, WE8ISO8859P15 - both ASSET and cargo need a working faststart
+image), convert both once at build time instead (see "Build sequencing"
+above) and ship both fully-completed PDBs in the archive. At container
+start, `startFaststart.sh` just drops the unwanted variant
+(`DROP PLUGGABLE DATABASE ... INCLUDING DATAFILES`) and renames the kept
+one to `$ORACLE_PDB` (`ALTER PLUGGABLE DATABASE ... RENAME GLOBAL_NAME`) -
+both cheap, mostly-metadata operations, seconds not minutes.
+
+**Final measured result, both variants verified end-to-end (2026-09-20):**
+decompress 54s, instance start 34s, variant selection (drop+rename) 5s,
+remaining hooks 3s - **~1:38 min total**, vs. ~8-9 min for the regular
+image (~5.5x faster), with both `ORACLE_CHARACTERSET=AL32UTF8` (default)
+and `WE8ISO8859P15` confirmed working (correct `NLS_CHARACTERSET`, correct
+`$ORACLE_PDB` name, service-name login through the listener both tested
+directly).
+
+Bugs found and fixed along the way (all by actually building and running
+the image, not by inspection):
+- `buildFaststart.sh` calls `createDB.sh` directly, bypassing
+  `runOracle.sh`'s own `ORACLE_CHARACTERSET=${ORACLE_CHARACTERSET:-AL32UTF8}`
+  default - left unset, dbca converted to AL32UTF8 **at build time**,
+  silently defeating the whole "convert at container start" design (the bug
+  behind the false ~1:17 min measurement above). Fixed by explicitly
+  exporting `ORACLE_CHARACTERSET=US7ASCII` before calling `createDB.sh`.
+- Redo log shrink (add 3x50M groups, drop the original 3x200M ones): a
+  `tr -d '[:space:]'` meant to strip whitespace from a multi-row SQL result
+  also ate the newlines, collapsing 3 group numbers into one bogus
+  concatenated value - silently left all 3 old logs undropped. Fixed with
+  `tr -d ' \t\r'` (newlines preserved).
+- The retry loop for dropping a redo log group only *waited* on failure -
+  on an idle, freshly created database nothing triggers a log switch on its
+  own, so a group that happened to still be CURRENT would never become
+  droppable no matter how long the loop waited. Fixed by actively issuing
+  `ALTER SYSTEM SWITCH LOGFILE` on every failed attempt.
+- Deleting old redo log files (`DROP LOGFILE GROUP` doesn't delete the OS
+  file) was unconditional on the originally-captured file list, regardless
+  of whether that specific group's drop actually succeeded - deleted a file
+  the database still referenced as an active online log, crashing the
+  instance with `ORA-00313`/`ORA-00312` on the next `OPEN`. Fixed by only
+  deleting a group's file immediately after confirming its `DROP` succeeded.
+- `ALTER SYSTEM ENABLE RESTRICTED SESSION` only blocks *new* connections -
+  `INTERNAL_CONVERT` itself additionally requires *zero* other sessions
+  connected at all (`ORA-12721`), and dbca/createDB.sh can leave a
+  lingering session behind for a moment right after returning control.
+  Fixed by killing every non-background, non-self session before each
+  conversion attempt, retrying a few times if `ORA-12721` still shows up.
+- Plugging the unplugged ISO-variant PDB back in (`CREATE PLUGGABLE
+  DATABASE ... USING '<xml>' NOCOPY`) failed with `ORA-27038: created file
+  already exists` / `ORA-01119` - `UNPLUG` doesn't preserve temp files (no
+  persistent data in them), so `PLUG IN` always tries to create a fresh
+  one, but the PDB's own old tempfile is still physically sitting at that
+  exact path (its subdirectory was deliberately left untouched by the
+  snapshot/restore). Fixed by adding `TEMPFILE REUSE` to the `CREATE
+  PLUGGABLE DATABASE ... USING` statement.
+- `ALTER PLUGGABLE DATABASE ... RENAME GLOBAL_NAME` failed with
+  `ORA-65045: pluggable database not in a restricted mode` when the PDB
+  was simply open (not restricted) - the rename needs the PDB closed and
+  reopened in `RESTRICTED` mode first, then closed and reopened normally
+  afterward to make it usable again. Fixed by adding that CLOSE/OPEN
+  RESTRICTED/rename/CLOSE/OPEN bounce (see the code block below).
+- A `sql()` helper used for both DDL (wanted `FEEDBACK ON`, to log
+  "Database altered." confirmations) and a plain `SELECT` into a bash
+  array left `FEEDBACK ON` for the latter too, so a leaked "N rows
+  selected" footer line got parsed as if it were a redo group number,
+  breaking the shrink step's arithmetic (`value too great for base`).
+  Fixed by explicitly overriding `SET FEEDBACK OFF` for that one query,
+  plus a `^[0-9]+:` filter as a second line of defense.
 
 The trade-off: skipping `dbca -createDatabase` also skips the step that
 currently keeps `ORACLE_SID` runtime-configurable (dbca generates fresh
@@ -408,49 +537,66 @@ every datafile header and regenerates redo - likely costs more than the
 `dbca` overhead it would replace, and is more fragile than the cheap
 metadata-only `INTERNAL_CONVERT`.
 
-Compression refinement: naively building the WE8ISO8859P15 and AL32UTF8
-variants *independently* (two separate `dbca -createDatabase` runs) would
-compress poorly together - two independently created databases differ at
-almost every block (SCN, checksums, DBID-dependent headers), so a compressor
-finds little to deduplicate. But `INTERNAL_CONVERT` is a metadata-only
-operation (the underlying bytes are already valid 7-bit ASCII in every
-target character set; only a handful of dictionary blocks - `PROPS$`'s
-`NLS_CHARACTERSET` row, the controlfile header - actually change). So
-deriving *both* variants from one identical US7ASCII snapshot (build it
-once, convert one copy to each target character set) makes them byte-
-identical except for that handful of blocks - a solid 7z archive (or a
-binary delta of one against the other, e.g. `xdelta3`/`rdiff`) covering
-both would compress close to "one copy plus a small diff", not "two full
-copies". Applies at either granularity: a full CDB$ROOT+PDB$SEED archive,
-or just a PDB-level archive (`INTERNAL_CONVERT` works the same way inside a
-PDB context - `ALTER SESSION SET CONTAINER=<pdb>` first - which is in fact
-exactly the second step of dbca's own stock-seed conversion sequence, see
-"Character sets" above).
+Compression note (not yet applied - `tar|xz` is still the current
+packaging, see "7z vs xz" above), backed by actual measurements
+(2026-09-20) on the full, correct content set (CDB$ROOT+PDB$SEED, ~3.7GB
+uncompressed - bigger than earlier assumed - plus both ~1.5GB customer
+PDBs, ~6.9GB uncompressed total):
 
-Refined design (2026-09-20, not implemented): ship *both* charset variants
-as pre-created PDBs inside one faststart archive - one CDB$ROOT+PDB$SEED,
-plus two fully-completed PDBs (one converted to WE8ISO8859P15, one to
-AL32UTF8), all derived from the identical US7ASCII source above. At
-container start: decompress, `startup`, `DROP PLUGGABLE DATABASE <unwanted>
-INCLUDING DATAFILES` (cheap - just removes files + a dictionary entry), then
-rename the kept one to `$ORACLE_PDB`:
+- **Two separate archives** (root+seed duplicated into each, one PDB per
+  archive) - the "obvious" alternative to shipping one combined archive -
+  came out *larger* overall: 1.1G (root+seed+PDBUTF8) + 819M
+  (root+seed+PDBISO) = **1.92G total**, worse than the current single
+  combined archive (1.4G), because root+seed's ~3.7GB gets compressed
+  twice instead of once. Ruled out.
+- `xz -6` gets **zero** cross-copy deduplication between the two customer
+  PDBs - compressed separately (315M + 313M) or together (628M) comes out
+  identical either way, because its default 8MiB dictionary can't span
+  the ~1.5GB distance between the copies.
+- A **solid-mode 7z archive of everything together** (root+seed + both
+  PDBs, one archive) came out at **685M** - less than half the current
+  1.4G, and the earlier worry that per-block SCNs/checksums would defeat
+  deduplication between the two independently-created PDBs turned out to
+  be unfounded (most of each PDB's content is static dictionary data -
+  Java/Spatial/RU BLOB - that's byte-identical between the two).
 
-    ALTER SESSION SET CONTAINER = <builtin_name>;
-    ALTER PLUGGABLE DATABASE <builtin_name> CLOSE;
-    ALTER PLUGGABLE DATABASE <builtin_name> OPEN RESTRICTED;
-    ALTER PLUGGABLE DATABASE <builtin_name> RENAME GLOBAL_NAME TO <ORACLE_PDB>;
+**Decompression speed - unresolved, needs a real in-container test**: an
+isolated host-side comparison initially suggested 7z decodes much faster
+than `xz -T0` even under realistic 2-4 core limits (`taskset`), but a
+*separate* attempt to verify the `xz -T0` half of that story by actually
+changing `startFaststart.sh` and rebuilding found **no measurable
+difference** in the real container (~54s either way, before and after).
+The two results contradict each other, and re-checking pointed at
+environment inconsistencies in the host-side benchmarks (some output went
+to a tmpfs-backed `/tmp`, not real disk) rather than a settled answer.
+Testing 7z properly needs the actual static `7zzs` binary gvenzl's project
+uses (a distro `7z` package is dynamically linked against a newer
+libstdc++ than this image ships, and fails to run here) copied into a real
+container - not yet done. Bottom line: the **685M vs 1.4G size result is
+solid** (measured directly, reproducible), but no decompression-speed
+number here should be trusted until it's re-measured end-to-end in an
+actual container, the same way the ~1:38 min total above was.
 
-Even lighter for service-name (EZCONNECT, `//host:port/service`) consumers
-specifically: skip the rename entirely and just register an *additional*
-service name on the already-open PDB - no CLOSE/OPEN RESTRICTED bounce at
-all, purely additive, can be done while the PDB is serving traffic:
+`startFaststart.sh`'s actual variant-selection logic (implemented) - the
+rename requires the PDB to be open in RESTRICTED mode first, a plain OPEN
+isn't enough (`ORA-65045`, caught by testing):
 
-    ALTER SESSION SET CONTAINER = <builtin_name>;
-    EXEC DBMS_SERVICE.CREATE_SERVICE(service_name => '<ORACLE_PDB>', network_name => '<ORACLE_PDB>');
-    EXEC DBMS_SERVICE.START_SERVICE('<ORACLE_PDB>');
+    -- both PDBUTF8 and PDBISO auto-open via their build-time SAVE STATE
+    ALTER SESSION SET "_oracle_script" = TRUE;
+    ALTER PLUGGABLE DATABASE <unwanted> CLOSE IMMEDIATE;
+    DROP PLUGGABLE DATABASE <unwanted> INCLUDING DATAFILES;
+    ALTER PLUGGABLE DATABASE <kept> CLOSE IMMEDIATE;
+    ALTER PLUGGABLE DATABASE <kept> OPEN RESTRICTED;
+    ALTER PLUGGABLE DATABASE <kept> RENAME GLOBAL_NAME TO <ORACLE_PDB>;
+    ALTER PLUGGABLE DATABASE <ORACLE_PDB> CLOSE IMMEDIATE;
+    ALTER PLUGGABLE DATABASE <ORACLE_PDB> OPEN;
+    ALTER PLUGGABLE DATABASE <ORACLE_PDB> SAVE STATE;
+    ALTER SYSTEM REGISTER;  -- immediate listener registration under the new name
 
-This only helps service-name consumers, though - see the SID-vs-service
-split below.
+`ORACLE_CHARACTERSET` therefore stays runtime-configurable in the
+faststart image too, but restricted to exactly `AL32UTF8` (default) or
+`WE8ISO8859P15` - the two variants actually shipped; anything else needs
+the regular (non-faststart) image.
 
 `RENAME GLOBAL_NAME` is a lightweight, standard, PDB-scoped dictionary
 operation (comparable in cost to the character-set conversion) - NOT the
