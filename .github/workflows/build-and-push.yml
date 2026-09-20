@@ -57,6 +57,17 @@ on:
           this check existed (see CI.md).
         required: false
         default: ""
+      build_faststart:
+        description: >-
+          (only with patching) Also build the extensions/faststart
+          extension on top of the patched+seeded image: ships a fully
+          pre-created CDB$ROOT+PDB$SEED plus both AL32UTF8 and
+          WE8ISO8859P15 customer-PDB variants, skipping dbca
+          -createDatabase entirely at container start (~49s vs ~8-9 min).
+          See extensions/patching/README.md's faststart section. Pushed
+          as "<push_tag>-faststart".
+        type: boolean
+        default: false
   # TEMPORARY: workflow_dispatch (UI or API) 404s for a workflow that has
   # never run and isn't on the default branch - this push trigger exists
   # only to bootstrap that first run, then gets removed again. The job
@@ -170,6 +181,64 @@ jobs:
             fi
             ls -l $T | awk "NR>1 {printf \"%8.1f MB  %s\n\", \$5/1048576, \$9}"'
 
+      # build_faststart requires patching: the extension builds FROM the
+      # patched+seeded -ext image (src_tag) and its own Dockerfile also
+      # needs "<image_tag>-base" (the lean, pre-patching sibling) - which
+      # buildContainerImage.sh -p's own internal buildExtensions.sh call
+      # already built and tagged as a side effect of the "Build image"
+      # step above, precisely because patching was requested. Without
+      # patching there is no -ext image and no -base sibling to build from.
+      - name: Build faststart extension
+        id: faststart
+        if: inputs.build_faststart
+        working-directory: OracleDatabase/SingleInstance/extensions
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.patching }}" != "true" ]; then
+            echo "::error::build_faststart requires patching to also be enabled (faststart builds FROM the patched+seeded -ext image)"
+            exit 1
+          fi
+          FASTSTART_TAG="${{ steps.build.outputs.src_tag }}-faststart"
+          ./buildExtensions.sh \
+            -b "${{ steps.build.outputs.src_tag }}" \
+            -t "${FASTSTART_TAG}" \
+            -x faststart \
+            -o "--build-arg BASE_IMAGE_LEAN=${{ inputs.image_tag }}-base"
+          echo "faststart_tag=${FASTSTART_TAG}" >> "$GITHUB_OUTPUT"
+
+      # Smoke test both character-set variants end-to-end (decompress,
+      # instance start, variant selection, ready) - faststart's own new
+      # failure modes (wrong PDB kept/dropped, PLUG IN/rename breaking)
+      # aren't covered by the patch-level/seed-template checks above,
+      # which only apply to src_tag, not this repackaged derivative.
+      - name: Verify faststart image
+        if: inputs.build_faststart
+        run: |
+          set -euo pipefail
+          for charset in AL32UTF8 WE8ISO8859P15; do
+            echo "::group::Testing ORACLE_CHARACTERSET=${charset}"
+            CID=$(docker run -d -e ORACLE_PWD=Welcome1 -e ORACLE_CHARACTERSET="${charset}" \
+              "${{ steps.faststart.outputs.faststart_tag }}")
+            READY=""
+            for _ in $(seq 1 60); do
+              if docker logs "$CID" 2>&1 | grep -q "DATABASE IS READY TO USE"; then
+                READY=1
+                break
+              fi
+              if docker logs "$CID" 2>&1 | grep -qE "ORA-|E R R O R"; then
+                break
+              fi
+              sleep 3
+            done
+            docker logs "$CID" 2>&1 | tail -100
+            docker rm -f "$CID" >/dev/null
+            echo "::endgroup::"
+            if [ -z "$READY" ]; then
+              echo "::error::faststart image did not become ready with ORACLE_CHARACTERSET=${charset} - see log above"
+              exit 1
+            fi
+          done
+
       # One-time host setup required before this step works:
       # add "vsdock01.pcsoft.de:5000" to /etc/docker/daemon.json's
       # "insecure-registries" on the runner host and restart docker,
@@ -185,3 +254,7 @@ jobs:
           echo "${REGISTRY_PASSWORD}" | docker login vsdock01.pcsoft.de:5000 -u "${REGISTRY_USER}" --password-stdin
           docker tag "${{ steps.build.outputs.src_tag }}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
           docker push "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}"
+          if [ "${{ inputs.build_faststart }}" = "true" ]; then
+            docker tag "${{ steps.faststart.outputs.faststart_tag }}" "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}-faststart"
+            docker push "vsdock01.pcsoft.de:5000/${{ inputs.push_tag }}-faststart"
+          fi
