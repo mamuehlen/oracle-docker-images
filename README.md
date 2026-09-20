@@ -4,6 +4,33 @@ This repository contains [Dockerfiles](https://docs.docker.com/engine/reference/
 and samples to build [Docker](https://www.docker.com/what-docker) images for
 Oracle commercial products and [Oracle sponsored open source projects](https://opensource.oracle.com).
 
+## ZEDAS fork (this branch, `zedas-patches`)
+
+This is ZEDAS' internal fork of Oracle's upstream repository. `main` stays a
+clean, unmodified mirror of `oracle/docker-images` - everything ZEDAS-specific
+lives exclusively on `zedas-patches`, under
+[`OracleDatabase/SingleInstance/extensions/`](OracleDatabase/SingleInstance/extensions/):
+
+- **[`extensions/patching`](OracleDatabase/SingleInstance/extensions/patching/README.md)**:
+  bakes a Release Update (RU) into the 19c image at build time and
+  regenerates the dbca seed template at that patched level, so containers
+  skip the ~30 min `datapatch` run that would otherwise happen on every
+  first start. (Not needed for 23.26/26ai Gold Images, which already ship
+  pre-patched - see the README.)
+- **[`extensions/faststart`](OracleDatabase/SingleInstance/extensions/patching/README.md#faststart-ci-variant-implemented-faststart)**:
+  ships a fully pre-created database - both `AL32UTF8` and `WE8ISO8859P15`
+  character-set variants baked in, selected at container start - skipping
+  `dbca -createDatabase` entirely (~11-22x faster container start than the
+  regular image, measured against both 19.32 SE2 and 23.26 SE2). Also
+  supports persistence and forward `datapatch` against a mounted volume, see
+  the same README's "Persistence and datapatch" section.
+
+Why: fast, disposable, pre-patched Oracle DB containers for ASSET/cargo
+CI and local dev, without paying the regular image's patch/seed-creation
+cost on every single container start. Built and pushed via the
+[`build-and-push.yml`](.github/workflows/build-and-push.yml) GitHub Actions
+workflow - see [`CI.md`](CI.md) for how to trigger it and example inputs.
+
 ## Container Images on GitHub
 
 These images will require you to download any required Oracle commercial

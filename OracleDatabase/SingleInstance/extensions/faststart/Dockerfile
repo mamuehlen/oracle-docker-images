@@ -76,25 +76,35 @@ RUN chmod ug+x "$ORACLE_BASE"/buildFaststart.sh && \
     "$ORACLE_BASE"/buildFaststart.sh && \
     rm -f "$ORACLE_BASE"/buildFaststart.sh
 
-# This image never calls dbca -createDatabase or datapatch again, so none
-# of the following is needed at runtime: every dbca seed/clone template
-# (its one and only use already happened, just above - NOT just the ones
-# matching our own 19.32 regenerated-template naming, "General_Purpose_
-# <RU>.*": a stock (non-regenerated, e.g. a 23.26 Gold Image) seed is named
+# This image never calls dbca -createDatabase again (its build-time use in
+# buildFaststart.sh is the only one), so none of the following is needed at
+# runtime: every dbca seed/clone template (NOT just the ones matching our
+# own 19.32 regenerated-template naming, "General_Purpose_<RU>.*": a stock
+# (non-regenerated, e.g. a 23.26 Gold Image) seed is named
 # "General_Purpose.dbc"/"Seed_Database.ctl/.dfb*" instead, so this removes
 # the templates directory's contents wholesale rather than name-matching -
 # 1.1GB for our regenerated 19.32 template, 417MB for a stock 23.26 Gold
-# Image one, checked 2026-09-20), the base image's createDB.sh, any per-RU
-# sqlpatch zip (there wasn't actually one present for 19.32 - the
+# Image one, checked 2026-09-20), and the base image's createDB.sh.
+#
+# rollback_files/ (686MB across the 3 RU/bug directories present for
+# 19.32, 669MB of it from the main RU alone) is removed too, but for a
+# narrower reason than "never runs datapatch again" - since 2026-09-20
+# startFaststart.sh DOES run datapatch, forward, when a newer image starts
+# against a volume last touched by an older one (see
+# ../patching/README.md's "Persistence and datapatch" section). Forward
+# `datapatch` only ever reads `<bug>_apply.sql` (kept); `rollback_files/`
+# backs a specific, deliberate `datapatch -rollback <bug>` instead, which
+# this image just doesn't support - a real but narrow trade-off, not the
+# "datapatch never runs at all" case this comment used to claim. Any per-RU
+# sqlpatch zip is removed for the same "not needed for forward apply"
+# reason (there wasn't actually one present for 19.32 - the
 # `-iname '*.zip' -delete` below was always a no-op there, checked
-# 2026-09-20 - kept for whichever version does ship one), and each RU/bug
-# directory's `rollback_files/` (686MB across the 3 present for 19.32,
-# 669MB of it from the main RU alone) - datapatch's own rollback
-# mechanism, moot since this image's database is a fixed, one-shot state
-# that never gets re-patched or rolled back. Removed HERE, inside the
-# builder stage itself, not in the final stage - see BASE_IMAGE_LEAN's
-# comment above for why that distinction is exactly what makes this
-# actually shrink the final image instead of just whiting the files out.
+# 2026-09-20 - kept for whichever version does ship one).
+#
+# Removed HERE, inside the builder stage itself, not in the final stage -
+# see BASE_IMAGE_LEAN's comment above for why that distinction is exactly
+# what makes this actually shrink the final image instead of just whiting
+# the files out.
 RUN find "$ORACLE_HOME"/assistants/dbca/templates -mindepth 1 -delete && \
     rm -f "$ORACLE_BASE"/scripts/base/createDB.sh && \
     find "$ORACLE_HOME"/sqlpatch -mindepth 3 -maxdepth 3 -iname '*.zip' -delete && \

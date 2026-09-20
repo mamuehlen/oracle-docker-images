@@ -760,6 +760,52 @@ else fails fast with a clear error naming the two supported values, see
 `ORCLCDB` (baked in at build time, see "What remains fixed either way"
 above); setting it at container start has no effect on this image.
 
+### Persistence and datapatch (2026-09-20)
+
+Originally this image only worked for throwaway `--rm` containers: every
+start unconditionally decompressed the archive and ran the variant-
+selection/rename dance, which would outright fail on a second start
+against the same data (`PDBISO`/`PDBUTF8` no longer exist under those
+names after the first run's rename). Mount `$ORACLE_BASE/oradata` as a
+volume and this image now also supports the same persistence contract the
+regular image uses, checked the same way `runOracle.sh` does (the
+`CHECKPOINT_FILE_EXTN` marker file):
+
+- **First start against an empty/new volume**: identical to the
+  no-persistence case, plus a checkpoint file written at the end
+  (`oradata/.${ORACLE_SID}${CHECKPOINT_FILE_EXTN}`).
+- **Later starts against that same volume** (the same container restarted,
+  or a new container pointed at the same volume): decompression and the
+  variant-selection/rename dance are both skipped - just `STARTUP` on
+  what's already there.
+- **Starting a newer, differently-patched faststart image against a volume
+  last touched by an older one**: `extensions/patching/runDatapatch.sh` now
+  actually runs. `startFaststart.sh` previously never called the
+  `scripts/extensions/startup` hook chain at all, so this script - present
+  in the image the whole time - never executed. It compares the new
+  image's `opatch lspatches` against the baseline `savePatchSummary.sh`
+  wrote into the volume on the very first start (or whatever it last wrote
+  there itself), and runs `datapatch` only if they differ - the exact same
+  mechanism the regular image uses, completely unmodified. A no-op if the
+  image was built with `patching=false` (e.g. a 23.26 Gold Image, which
+  never includes `runDatapatch.sh` in the first place) - `runUserScripts.sh`
+  silently skips a missing/empty hook directory.
+
+Safety: an absent checkpoint means "start clean," not "extract over
+whatever happens to be there" - `oradata/<SID>/` and
+`oradata/dbconfig/<SID>/` are removed first (mirroring `runOracle.sh`'s own
+`rm -rf` in its "database doesn't exist yet" branch), so a crashed or
+partial previous extraction can never be mistaken for a complete one and
+silently started against.
+
+**Not supported**: rolling a specific patch back (`datapatch -rollback
+<bug>`) against a faststart-created database. Each faststart image deletes
+`sqlpatch/<RU>/<bug>/rollback_files/` at build time (up to ~670 MB for a
+single bug in a typical RU - see the size breakdown above) to keep the
+image small. Ordinary forward `datapatch` never reads `rollback_files/`
+(only `<bug>_apply.sql`, which is kept), so this only forecloses a
+deliberate, rare "undo this one bug fix" operation, not normal patching.
+
 ### Turning it off
 
 `REGENERATE_SEED=true` is the default of the `seedgen` stage's build arg.
