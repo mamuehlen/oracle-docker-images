@@ -77,23 +77,26 @@ RUN chmod ug+x "$ORACLE_BASE"/buildFaststart.sh && \
     rm -f "$ORACLE_BASE"/buildFaststart.sh
 
 # This image never calls dbca -createDatabase or datapatch again, so none
-# of the following is needed at runtime: the ~1.1GB regenerated seed
-# template (its one and only use already happened, just above), the base
-# image's createDB.sh, any per-RU sqlpatch zip (there wasn't actually one
-# present - the `-iname '*.zip' -delete` below was always a no-op, checked
-# 2026-09-20), and each RU/bug directory's `rollback_files/` (686MB across
-# the 3 present here, 669MB of it from the main 19.32 RU alone) - datapatch's
-# own rollback mechanism, moot since this image's database is a fixed,
-# one-shot state that never gets re-patched or rolled back. Removed HERE,
-# inside the builder stage itself, not in the final stage - see
-# BASE_IMAGE_LEAN's comment above for why that distinction is exactly what
-# makes this actually shrink the final image instead of just whiting the
-# files out.
-RUN rm -f "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dbc \
-          "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.ctl \
-          "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.dfb* \
-          "$ORACLE_HOME"/assistants/dbca/templates/General_Purpose_*.README \
-          "$ORACLE_BASE"/scripts/base/createDB.sh && \
+# of the following is needed at runtime: every dbca seed/clone template
+# (its one and only use already happened, just above - NOT just the ones
+# matching our own 19.32 regenerated-template naming, "General_Purpose_
+# <RU>.*": a stock (non-regenerated, e.g. a 23.26 Gold Image) seed is named
+# "General_Purpose.dbc"/"Seed_Database.ctl/.dfb*" instead, so this removes
+# the templates directory's contents wholesale rather than name-matching -
+# 1.1GB for our regenerated 19.32 template, 417MB for a stock 23.26 Gold
+# Image one, checked 2026-09-20), the base image's createDB.sh, any per-RU
+# sqlpatch zip (there wasn't actually one present for 19.32 - the
+# `-iname '*.zip' -delete` below was always a no-op there, checked
+# 2026-09-20 - kept for whichever version does ship one), and each RU/bug
+# directory's `rollback_files/` (686MB across the 3 present for 19.32,
+# 669MB of it from the main RU alone) - datapatch's own rollback
+# mechanism, moot since this image's database is a fixed, one-shot state
+# that never gets re-patched or rolled back. Removed HERE, inside the
+# builder stage itself, not in the final stage - see BASE_IMAGE_LEAN's
+# comment above for why that distinction is exactly what makes this
+# actually shrink the final image instead of just whiting the files out.
+RUN find "$ORACLE_HOME"/assistants/dbca/templates -mindepth 1 -delete && \
+    rm -f "$ORACLE_BASE"/scripts/base/createDB.sh && \
     find "$ORACLE_HOME"/sqlpatch -mindepth 3 -maxdepth 3 -iname '*.zip' -delete && \
     find "$ORACLE_HOME"/sqlpatch -type d -name rollback_files -exec rm -rf {} +
 

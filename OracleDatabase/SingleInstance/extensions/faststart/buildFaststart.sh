@@ -64,8 +64,27 @@ if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
 else
   memory=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
 fi
-[[ "${memory}" == "max" || -z "${memory}" ]] && memory=2147483648
+# 2GiB (runOracle.sh's own fallback, matched here for 19c) sizes dbca.rsp's
+# sga_target too small for 23ai: caught by testing against a 23.26 Gold
+# Image - "ORA-00821: Specified value of sga_target 1536M is too small,
+# needs to be at least 2896M" (1536M = 75% of a 2GiB ALLOCATED_MEMORY).
+# 4GiB comfortably covers both.
+[[ "${memory}" == "max" || -z "${memory}" ]] && memory=4294967296
 export ALLOCATED_MEMORY=$((memory/1024/1024))
+
+# We create both customer-PDB variants ourselves later - our own 19.32
+# regenerated seed template already has numberOfPDBs=0 (regenerateSeedTemplate.sh
+# sets it, since dbca can't create PDBs from a CDB clone template anyway -
+# DBT-10312), but a stock, non-regenerated template (e.g. a 23.26 Gold
+# Image's own, which this buildFaststart.sh never modified) defaults to
+# numberOfPDBs=1 and would have dbca auto-create its own customer PDB
+# alongside PDB$SEED - caught by testing: that PDB ends up named after
+# $ORACLE_PDB same as ours, and startFaststart.sh's later
+# RENAME GLOBAL_NAME TO $ORACLE_PDB then fails with "ORA-65042: name is
+# already used by an existing container". Forced to 0 here, unconditionally,
+# so this doesn't depend on whichever base image's template happens to
+# already have it set right.
+sed -i -e 's|^numberOfPDBs=.*|numberOfPDBs=0|' "${SCRIPT_BASE_DIR}/dbca.rsp.tmpl"
 
 log "creating CDB\$ROOT + PDB\$SEED via createDB.sh..."
 "${SCRIPT_BASE_DIR}/${CREATE_DB_FILE}" "${ORACLE_SID}" "${ORACLE_PDB}" "${ORACLE_PWD}"
@@ -103,19 +122,49 @@ EXIT
 SQL
 }
 
+db_create_file_dest() {
+  sqlplus -s / as sysdba <<SQL | tr -d ' \t\r\n'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT value FROM v\$parameter WHERE name = 'db_create_file_dest';
+EXIT
+SQL
+}
+
 create_pdb_from_seed() {  # $1 = PDB name
-  local name="$1" pdb_dir seed_dir
+  local name="$1" pdb_dir seed_dir omf_dest datafile_clause tablespace_stmt
   seed_dir="$(seed_datafile_dir)"
   pdb_dir="${ORACLE_BASE}/oradata/${ORACLE_SID}/${name}"
   mkdir -p "${pdb_dir}"
   log "creating pluggable database ${name} from PDB\$SEED..."
+  # Oracle Managed Files (db_create_file_dest set - the case for a 23.26
+  # Gold Image's stock seed, unlike our own regenerated 19.32 one, which
+  # doesn't use OMF): PDB$SEED's datafiles are named "o1_mf_*", and
+  # FILE_NAME_CONVERT-ing that same OMF-looking name into a new directory
+  # fails with ORA-01276 "File has an Oracle Managed Files file name" -
+  # caught by testing. OMF wants to generate its own fresh unique names,
+  # not reuse the source's verbatim under a new path. Let it, instead of
+  # forcing FILE_NAME_CONVERT: omit the clause (OMF places files under
+  # db_create_file_dest) and skip the explicit tablespace datafile path
+  # too, for the same reason.
+  # 5M (which worked fine for 19.32) is below 23ai's minimum tablespace
+  # datafile size - caught by testing: "ORA-03214: The specified file
+  # size is smaller than the minimum blocks 784" (784 blocks at an 8K
+  # block size is ~6.1M). 10M clears both versions' minimums comfortably.
+  omf_dest="$(db_create_file_dest)"
+  if [ -n "${omf_dest}" ]; then
+    datafile_clause=""
+    tablespace_stmt="CREATE TABLESPACE USERS DATAFILE SIZE 10M AUTOEXTEND ON NEXT 1280K MAXSIZE UNLIMITED;"
+  else
+    datafile_clause="FILE_NAME_CONVERT = ('${seed_dir}', '${pdb_dir}/')"
+    tablespace_stmt="CREATE TABLESPACE USERS DATAFILE '${pdb_dir}/users01.dbf' SIZE 10M REUSE AUTOEXTEND ON NEXT 1280K MAXSIZE UNLIMITED;"
+  fi
   sql <<EOF
 CREATE PLUGGABLE DATABASE ${name} ADMIN USER PDBADMIN IDENTIFIED BY "${ORACLE_PWD}"
-  FILE_NAME_CONVERT = ('${seed_dir}', '${pdb_dir}/');
+  ${datafile_clause};
 ALTER PLUGGABLE DATABASE ${name} OPEN;
 ALTER PLUGGABLE DATABASE ${name} SAVE STATE;
 ALTER SESSION SET CONTAINER = ${name};
-CREATE TABLESPACE USERS DATAFILE '${pdb_dir}/users01.dbf' SIZE 5M REUSE AUTOEXTEND ON NEXT 1280K MAXSIZE UNLIMITED;
+${tablespace_stmt}
 ALTER DATABASE DEFAULT TABLESPACE USERS;
 ALTER SESSION SET CONTAINER = CDB\$ROOT;
 GRANT SELECT ON sys.v_\$pdbs TO OPS\$oracle;
@@ -230,6 +279,26 @@ EOF
 convert_root_and_seed WE8ISO8859P15
 create_pdb_from_seed "${PDB_ISO}"
 
+# Which top-level subdirectory(ies) of oradata/<SID>/ actually hold
+# ${PDB_ISO}'s files - queried from Oracle itself rather than assumed to
+# be named after the PDB: with Oracle Managed Files active (a 23.26 Gold
+# Image's stock seed, see create_pdb_from_seed above), the OMF-generated
+# directory name doesn't necessarily match the PDB name the way our own
+# FILE_NAME_CONVERT-based (non-OMF) path always does for 19.32. Whatever
+# it's actually called, this is what the restore step below must not
+# delete.
+mapfile -t PDBISO_KEEP_DIRS < <(sqlplus -s / as sysdba <<EOF | tr -d ' \t\r' | grep -v '^$' | sort -u
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT DISTINCT REGEXP_SUBSTR(name, '^${ORACLE_BASE}/oradata/${ORACLE_SID}/([^/]+)', 1, 1, NULL, 1)
+FROM v\$datafile WHERE con_id = (SELECT con_id FROM v\$pdbs WHERE name = '${PDB_ISO}')
+UNION
+SELECT DISTINCT REGEXP_SUBSTR(name, '^${ORACLE_BASE}/oradata/${ORACLE_SID}/([^/]+)', 1, 1, NULL, 1)
+FROM v\$tempfile WHERE con_id = (SELECT con_id FROM v\$pdbs WHERE name = '${PDB_ISO}');
+EXIT
+EOF
+)
+log "  ${PDB_ISO}'s files live under: ${PDBISO_KEEP_DIRS[*]:-(none under oradata/${ORACLE_SID} - nothing to preserve there)}"
+
 log "unplugging ${PDB_ISO} (keeps its datafiles, only drops the dictionary entry)..."
 sql <<EOF
 ALTER PLUGGABLE DATABASE ${PDB_ISO} CLOSE IMMEDIATE;
@@ -241,7 +310,11 @@ sqlplus -s / as sysdba <<'EOF'
 WHENEVER SQLERROR EXIT FAILURE
 SHUTDOWN IMMEDIATE;
 EOF
-find "${ORACLE_BASE}/oradata/${ORACLE_SID}" -mindepth 1 -maxdepth 1 ! -name "${PDB_ISO}" -exec rm -rf {} +
+KEEP_ARGS=()
+for d in "${PDBISO_KEEP_DIRS[@]}"; do
+  KEEP_ARGS+=(! -name "${d}")
+done
+find "${ORACLE_BASE}/oradata/${ORACLE_SID}" -mindepth 1 -maxdepth 1 "${KEEP_ARGS[@]}" -exec rm -rf {} +
 cp -a "${US7ASCII_BACKUP}/." "${ORACLE_BASE}/oradata/${ORACLE_SID}/"
 sqlplus -s / as sysdba <<'EOF'
 WHENEVER SQLERROR EXIT FAILURE

@@ -14,9 +14,16 @@ on:
         required: true
         default: "-s"
       patching:
-        description: "Also apply the extensions/patching extension (-p)"
+        description: >-
+          Also apply the extensions/patching extension (-p). Defaults on
+          together with build_faststart, so a bare run produces a properly
+          RU-patched result, not the unpatched-but-still-buildable
+          combination the build_faststart description warns about. Turn
+          off only for a deliberate vanilla/unpatched build (fetch_map
+          still needs to match whichever combination you pick - see its
+          own description).
         type: boolean
-        default: false
+        default: true
       regenerate_seed:
         description: >-
           (only with patching) Rebuild the dbca seed template at the patched
@@ -59,15 +66,23 @@ on:
         default: ""
       build_faststart:
         description: >-
-          (only with patching) Also build the extensions/faststart
-          extension on top of the patched+seeded image: ships a fully
-          pre-created CDB$ROOT+PDB$SEED plus both AL32UTF8 and
-          WE8ISO8859P15 customer-PDB variants, skipping dbca
-          -createDatabase entirely at container start (~49s vs ~8-9 min).
-          See extensions/patching/README.md's faststart section. Pushed
-          as "<push_tag>-faststart".
+          Also build the extensions/faststart extension on top of this
+          run's image (works with or without patching - e.g. a 23.26 Gold
+          Image needs no separate patching step at all, see the README):
+          ships a fully pre-created CDB$ROOT+PDB$SEED plus both AL32UTF8
+          and WE8ISO8859P15 customer-PDB variants, skipping dbca
+          -createDatabase entirely at container start (~49s vs ~8-9 min
+          for 19.32, ~13 min for a 23.26 Gold Image). Defaults on since
+          it's the preferred image going forward - but for 19.x this only
+          gives you a properly RU-patched result if `patching` is also
+          set; without it you'd get an unpatched faststart image (still
+          builds, just not what you usually want). For a 23.26 Gold Image
+          the default combination (this on, patching off) is already the
+          full, correctly patched result - Gold Images ship pre-patched,
+          see the README. See extensions/patching/README.md's faststart
+          section. Pushed as "<push_tag>-faststart".
         type: boolean
-        default: false
+        default: true
   # TEMPORARY: workflow_dispatch (UI or API) 404s for a workflow that has
   # never run and isn't on the default branch - this push trigger exists
   # only to bootstrap that first run, then gets removed again. The job
@@ -181,24 +196,36 @@ jobs:
             fi
             ls -l $T | awk "NR>1 {printf \"%8.1f MB  %s\n\", \$5/1048576, \$9}"'
 
-      # build_faststart requires patching: the extension builds FROM the
-      # patched+seeded -ext image (src_tag) and its own Dockerfile also
-      # needs "<image_tag>-base" (the lean, pre-patching sibling) - which
-      # buildContainerImage.sh -p's own internal buildExtensions.sh call
-      # already built and tagged as a side effect of the "Build image"
-      # step above, precisely because patching was requested. Without
-      # patching there is no -ext image and no -base sibling to build from.
+      # faststart's own multi-stage size fix needs a lean, pre-database
+      # sibling of src_tag to start its final stage from (see
+      # extensions/patching/README.md's faststart section, "Image size").
+      # With patching=true, buildContainerImage.sh -p's own internal
+      # buildExtensions.sh call already builds+tags "<image_tag>-base" as a
+      # side effect - but relying on that side effect would silently break
+      # for a patching=false build (e.g. a 23.26 Gold Image, which needs no
+      # separate RU/OPatch step at all - see the README). Built explicitly
+      # here instead, every time, via the same generic `-b` (`--target
+      # base`) flag buildContainerImage.sh already supports for any
+      # version/edition - a little redundant when patching=true (that
+      # side-effect build already did the same work, image layers cache
+      # it), but uniform and not dependent on an implicit side effect.
+      - name: Build lean base for faststart
+        if: inputs.build_faststart
+        working-directory: OracleDatabase/SingleInstance/dockerfiles
+        run: |
+          set -euo pipefail
+          ./buildContainerImage.sh -b \
+            -v "${{ inputs.version }}" \
+            ${{ inputs.edition_flag }} \
+            -t "${{ inputs.image_tag }}-base"
+
       - name: Build faststart extension
         id: faststart
         if: inputs.build_faststart
         working-directory: OracleDatabase/SingleInstance/extensions
         run: |
           set -euo pipefail
-          if [ "${{ inputs.patching }}" != "true" ]; then
-            echo "::error::build_faststart requires patching to also be enabled (faststart builds FROM the patched+seeded -ext image)"
-            exit 1
-          fi
-          FASTSTART_TAG="${{ steps.build.outputs.src_tag }}-faststart"
+          FASTSTART_TAG="${{ inputs.image_tag }}-faststart"
           ./buildExtensions.sh \
             -b "${{ steps.build.outputs.src_tag }}" \
             -t "${FASTSTART_TAG}" \
