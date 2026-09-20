@@ -701,11 +701,44 @@ would then work there as well. Today, with the SID-format connect
 string still in use, it doesn't; this stays a CI/throwaway-only trade-off
 for products still on that format.
 
-Conclusion: worth building as a *separate*, fixed-SID image for CI/throwaway
+Conclusion: built as a *separate*, fixed-SID image for CI/throwaway
 containers (exactly the use case gvenzl's `-faststart` and Oracle's own
 `prebuiltdb` extension - see `../prebuiltdb/README.md` - are meant for), not
 as a replacement for this general-purpose image, which needs `ORACLE_SID` to
-stay a runtime choice. Not implemented; noted here for later.
+stay a runtime choice. **Implemented** (`../faststart/`) - see above for the
+measured results and the CI workflow's `build_faststart` input
+(`.github/workflows/build-and-push.yml`) for how to build+push it. Only
+built and verified against 19.32.0.0 SE2 so far - untested against
+23.26/23ai, which changed enough about multitenant internals (non-CDB
+creation removed entirely, "Free PDB" concept) that the custom SQL
+sequences above (`INTERNAL_CONVERT`, `PLUG IN ... TEMPFILE REUSE`, the
+restricted-session-kill retry logic) shouldn't be assumed to carry over
+unchanged without actually testing it there.
+
+### How to build and run it
+
+    cd OracleDatabase/SingleInstance/extensions
+    ./buildExtensions.sh -b oracle/database:19.32.0.0-se2-ext \
+      -t oracle/database:19.32.0.0-se2-faststart -x faststart \
+      -o "--build-arg BASE_IMAGE_LEAN=oracle/database:19.32.0.0-se2-base"
+
+    docker run -d -e ORACLE_PWD=Welcome1 \
+      -e ORACLE_CHARACTERSET=AL32UTF8 \
+      oracle/database:19.32.0.0-se2-faststart
+
+`BASE_IMAGE_LEAN` defaults to `oracle/database:19.32.0.0-se2-base` already
+(see the Dockerfile), so the `-o` above is only needed when building
+against a differently-tagged `-ext`/`-base` pair (e.g. from CI, where
+`image_tag` varies per run - see the workflow's "Build faststart
+extension" step).
+
+Runtime env vars: `ORACLE_PWD` (same as the regular image), `ORACLE_PDB`
+(defaults to `ORCLPDB1`, freely choosable - the rename is cheap), and
+`ORACLE_CHARACTERSET` (`AL32UTF8` default, or `WE8ISO8859P15` - anything
+else fails fast with a clear error naming the two supported values, see
+`startFaststart.sh`). **Not** configurable: `ORACLE_SID` - fixed at
+`ORCLCDB` (baked in at build time, see "What remains fixed either way"
+above); setting it at container start has no effect on this image.
 
 ### Turning it off
 
