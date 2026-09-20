@@ -1,8 +1,8 @@
 # LICENSE UPL 1.0
 #
 # Faststart extension (2026-09-20) - see extensions/patching/README.md,
-# "Possible future step: a faststart CI variant" for the full design
-# discussion and open questions.
+# "\"faststart\" CI variant (implemented, ../faststart/)" for the full
+# design discussion, measured results, and 19.32/23.26 status.
 #
 # Builds a CDB$ROOT+PDB$SEED once (reusing the base image's already-
 # regenerated, already-patched seed - no datapatch needed), PLUS both

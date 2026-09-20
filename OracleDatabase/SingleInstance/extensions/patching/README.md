@@ -707,13 +707,33 @@ containers (exactly the use case gvenzl's `-faststart` and Oracle's own
 as a replacement for this general-purpose image, which needs `ORACLE_SID` to
 stay a runtime choice. **Implemented** (`../faststart/`) - see above for the
 measured results and the CI workflow's `build_faststart` input
-(`.github/workflows/build-and-push.yml`) for how to build+push it. Only
-built and verified against 19.32.0.0 SE2 so far - untested against
-23.26/23ai, which changed enough about multitenant internals (non-CDB
-creation removed entirely, "Free PDB" concept) that the custom SQL
-sequences above (`INTERNAL_CONVERT`, `PLUG IN ... TEMPFILE REUSE`, the
-restricted-session-kill retry logic) shouldn't be assumed to carry over
-unchanged without actually testing it there.
+(`.github/workflows/build-and-push.yml`) for how to build+push it.
+
+Also built and verified against a 23.26.3 SE2 Gold Image (2026-09-20):
+both variants confirmed end-to-end (~36.5s AL32UTF8, ~45s WE8ISO8859P15,
+image 6.83GB with a 552M archive - even faster than 19.32's ~49s despite
+the smaller savings margin, since a 23.26 Gold Image's regular start is
+already ~13 min vs 19.32's ~8-9 min). The custom SQL sequences above
+(`INTERNAL_CONVERT`, `PLUG IN ... TEMPFILE REUSE`, the
+restricted-session-kill retry logic) carried over unchanged; what didn't
+was version-specific sizing and Oracle Managed Files, both fixed in
+`buildFaststart.sh`:
+
+- SGA minimum is higher (`ORA-00821`): the cgroup-memory fallback is 4GiB,
+  not 19c's 2GiB.
+- Minimum tablespace datafile size is higher (`ORA-03214`): 10M, not 5M.
+- A stock (non-regenerated) `dbca.rsp.tmpl` defaults to `numberOfPDBs=1`
+  and auto-creates its own customer PDB, colliding with the later rename
+  (`ORA-65042`) - forced to `numberOfPDBs=0` unconditionally.
+- The Gold Image's stock seed uses Oracle Managed Files (ours doesn't):
+  breaks the `FILE_NAME_CONVERT`-based clone (`ORA-01276`) and the
+  snapshot-restore's PDB-directory exclusion (OMF directories get GUID
+  names, not the PDB's own name) - both now detect OMF via
+  `db_create_file_dest` and adapt.
+
+No separate `extensions/patching` step is needed for a 23.26 Gold Image
+at all (see "26ai Gold Images ship their seed at the RU level" above), so
+the CI workflow's `build_faststart` works with `patching=false` there.
 
 ### How to build and run it
 
