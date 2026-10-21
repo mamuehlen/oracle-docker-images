@@ -46,7 +46,7 @@ LABEL "provider"="Oracle"                                                       
 
 # Argument to control removal of components not needed after db software installation
 ARG SLIMMING=true
-ARG INSTALL_FILE_1="p39581612_230000_Linux-x86-64.zip"
+ARG INSTALL_FILE_1="p40014644_230000_Linux-x86-64.zip"
 ARG BACKUP_MODULE_URL=""
 ARG BACKUP_MODULE_LOCAL_FILE=""
 
