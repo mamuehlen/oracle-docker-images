@@ -138,6 +138,32 @@ SELECT con_id, name, open_mode FROM v$pdbs;
 SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET';
 EOF
 
+# COMPATIBLE defaults to the base release (19.0.0), not the RU this image
+# is actually patched to - raising it later, at container start, forces a
+# full instance restart (~70s, confirmed by a consumer measuring it against
+# their own impdp step) every single time, for every container. Since the
+# whole point of a RU is to allow database features/formats up to its own
+# level, there's no reason not to set COMPATIBLE to the actual installed RU
+# right here, once, at build time - this makes imports of dumps exported at
+# or below this RU (the ORA-39358 case) work without ever touching it again.
+# version_full (12.2+, always available on 19c/23ai) reflects the patched
+# level (e.g. "19.32.0.0.0"), unlike the banner's own release number which
+# never changes with an RU - derived, not hardcoded, so this tracks whatever
+# RU this image was actually built against.
+log "setting COMPATIBLE to the installed RU level..."
+RU_VERSION=$(sqlplus -s / as sysdba <<'EOF' | tr -d ' \t\r\n'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT SUBSTR(version_full, 1, INSTR(version_full, '.', 1, 3) - 1) FROM v$instance;
+EOF
+)
+log "  installed RU version: ${RU_VERSION}"
+sql <<EOF
+ALTER SYSTEM SET COMPATIBLE='${RU_VERSION}' SCOPE=SPFILE;
+EOF
+# Not restarted here by itself - the US7ASCII snapshot step immediately
+# below already does a SHUTDOWN IMMEDIATE/STARTUP cycle of its own; this
+# piggybacks on that one instead of paying for a second.
+
 seed_datafile_dir() {
   sqlplus -s / as sysdba <<SQL | tr -d ' \t\r\n'
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF

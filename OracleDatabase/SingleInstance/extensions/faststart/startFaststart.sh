@@ -144,6 +144,27 @@ EXIT
 SQL
   log "variant selected: kept ${KEEP_PDB} as ${ORACLE_PDB}, dropped ${DROP_PDB}"
 
+  # createDB.sh's own setupTnsnames() baked a tnsnames.ora PDB entry at
+  # BUILD time, under buildFaststart.sh's own hardcoded ORACLE_PDB=ORCLPDB1
+  # - not whatever $ORACLE_PDB the kept variant just got renamed to above.
+  # That only went unnoticed because ORCLPDB1 is also this script's own
+  # runtime default; set ORACLE_PDB to anything else and the alias is
+  # simply missing (ORA-12154 for any client connecting via TNS name
+  # instead of EZConnect). Rewrite it now that the real name is known -
+  # exact same two entries setupTnsnames() itself would produce.
+  log "writing tnsnames.ora entry for ${ORACLE_PDB}..."
+  cat > "${DBCONFIG}/tnsnames.ora" <<EOF
+${ORACLE_SID}=localhost:1521/${ORACLE_SID}
+${ORACLE_PDB}=
+(DESCRIPTION =
+  (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))
+  (CONNECT_DATA =
+    (SERVER = DEDICATED)
+    (SERVICE_NAME = ${ORACLE_PDB})
+  )
+)
+EOF
+
   # Same setup hooks a regular container start's "database just created"
   # branch runs: 20_se2LicenseSettings.sh, 30_se2CtxsysNocompress.sh,
   # savePatchSummary.sh - unmodified, reused as-is, and (like there) only
@@ -156,8 +177,99 @@ SQL
   # to its harmless already-done case.
   "${SCRIPT_BASE_DIR}/${USER_SCRIPTS_FILE}" "${ORACLE_BASE}/scripts/extensions/setup"
 
+  # Same custom-provided setup hooks runOracle.sh runs right after its own
+  # extensions/setup call, on a freshly created database - this image never
+  # ran them at all before (startFaststart.sh only ever knew about its own
+  # extensions/ hook directories), so anything mounted into
+  # scripts/setup/ (consumer-provided data import, schema setup, ...) was
+  # silently skipped. Setup-only, matching runOracle.sh: first start only.
+  "${SCRIPT_BASE_DIR}/${USER_SCRIPTS_FILE}" "${ORACLE_BASE}/scripts/setup"
+
   date -Iseconds > "${CHECKPOINT_FILE}"
   log "checkpoint written - future starts against this volume will skip decompression and variant selection"
+fi
+
+# Same intent as runOracle.sh's own "prebuiltdb" password-override path
+# (ORACLE_PWD against a database whose password was baked in at build
+# time, see buildFaststart.sh) - but NOT via the shared setPassword.sh
+# itself. That script re-derives the PDB name from the oradata/<SID>/*/
+# directory LISTING, assuming directory name == current PDB name (true for
+# the regular image, where dbca creates the PDB already under its final
+# name). faststart breaks that assumption on purpose: the directory stays
+# named after the build-time variant (PDBISO/PDBUTF8 - see buildFaststart.sh)
+# even after RENAME GLOBAL_NAME changes the dictionary's PDB name above, so
+# setPassword.sh's own detection picks the stale pre-rename name and fails
+# (caught by testing: "ORA-01918: user 'PDBADMIN' does not exist", since
+# ALTER SESSION SET CONTAINER=PDBUTF8 switched into the wrong container).
+# $ORACLE_PDB is already correct at this point (just renamed, or already
+# correct from a prior start) - use it directly instead of re-deriving it.
+if [ -n "${ORACLE_PWD:-}" ]; then
+  log "applying ORACLE_PWD to SYS/SYSTEM/PDBADMIN..."
+  sqlplus -s / as sysdba <<SQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+ALTER USER SYS IDENTIFIED BY "${ORACLE_PWD}";
+ALTER USER SYSTEM IDENTIFIED BY "${ORACLE_PWD}";
+ALTER SESSION SET CONTAINER=${ORACLE_PDB};
+ALTER USER PDBADMIN IDENTIFIED BY "${ORACLE_PWD}";
+EXIT
+SQL
+fi
+
+# Optional per-container SGA/PGA/processes sizing, same INIT_SGA_SIZE/
+# INIT_PGA_SIZE/INIT_PROCESSES env vars createDB.sh honors - but only at
+# build time, via dbca's response file (see createDB.sh), which never runs
+# per-container here (this image's DB is built once and shipped). Re-
+# implemented at every start instead, so a faststart container can still be
+# sized without an image rebuild. Only actually touches the spfile (and
+# restarts) when a value is given AND differs from what's already set -
+# otherwise every single restart would pay for a pointless extra shutdown/
+# startup cycle even when nothing changed.
+RESIZE_NEEDED=""
+if [ -n "${INIT_SGA_SIZE:-}" ] && [ -n "${INIT_PGA_SIZE:-}" ]; then
+  CURRENT_SGA_MB=$(sqlplus -s / as sysdba <<'SQL' | tr -d ' \t\r\n'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT ROUND(value/1048576) FROM v$parameter WHERE name = 'sga_target';
+SQL
+)
+  CURRENT_PGA_MB=$(sqlplus -s / as sysdba <<'SQL' | tr -d ' \t\r\n'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT ROUND(value/1048576) FROM v$parameter WHERE name = 'pga_aggregate_target';
+SQL
+)
+  if [ "${CURRENT_SGA_MB}" != "${INIT_SGA_SIZE}" ] || [ "${CURRENT_PGA_MB}" != "${INIT_PGA_SIZE}" ]; then
+    log "resizing SGA/PGA: sga_target ${CURRENT_SGA_MB}M -> ${INIT_SGA_SIZE}M, pga_aggregate_target ${CURRENT_PGA_MB}M -> ${INIT_PGA_SIZE}M"
+    sqlplus -s / as sysdba <<SQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+ALTER SYSTEM SET sga_target=${INIT_SGA_SIZE}M SCOPE=SPFILE;
+ALTER SYSTEM SET pga_aggregate_target=${INIT_PGA_SIZE}M SCOPE=SPFILE;
+EXIT
+SQL
+    RESIZE_NEEDED=1
+  fi
+fi
+if [ -n "${INIT_PROCESSES:-}" ]; then
+  CURRENT_PROCESSES=$(sqlplus -s / as sysdba <<'SQL' | tr -d ' \t\r\n'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT value FROM v$parameter WHERE name = 'processes';
+SQL
+)
+  if [ "${CURRENT_PROCESSES}" != "${INIT_PROCESSES}" ]; then
+    log "resizing processes: ${CURRENT_PROCESSES} -> ${INIT_PROCESSES}"
+    sqlplus -s / as sysdba <<SQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+ALTER SYSTEM SET processes=${INIT_PROCESSES} SCOPE=SPFILE;
+EXIT
+SQL
+    RESIZE_NEEDED=1
+  fi
+fi
+if [ -n "${RESIZE_NEEDED}" ]; then
+  log "restarting instance to apply SGA/PGA/processes resize..."
+  sqlplus -s / as sysdba <<'SQL'
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SHUTDOWN IMMEDIATE;
+STARTUP;
+SQL
 fi
 
 # Same startup hooks a regular container start always runs, including on a
@@ -174,6 +286,14 @@ fi
 # only if they differ. This never needed touching - it only had to
 # actually be called, which faststart never did before.
 "${SCRIPT_BASE_DIR}/${USER_SCRIPTS_FILE}" "${ORACLE_BASE}/scripts/extensions/startup"
+
+# Same custom-provided startup hooks runOracle.sh always runs after its own
+# extensions/startup call, on EVERY start (fresh or restart) - see the
+# scripts/setup comment above for why this was missing. Most importantly
+# this is where a consumer's own data-import script (mounted into
+# scripts/startup/, same convention runOracle.sh itself documents) actually
+# gets a chance to run at all.
+"${SCRIPT_BASE_DIR}/${USER_SCRIPTS_FILE}" "${ORACLE_BASE}/scripts/startup"
 
 if "${SCRIPT_BASE_DIR}/${CHECK_DB_FILE}"; then
   echo "#########################"
