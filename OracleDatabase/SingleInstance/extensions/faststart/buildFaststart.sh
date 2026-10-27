@@ -405,6 +405,106 @@ EOF
 done
 
 # ---------------------------------------------------------------------------
+# 2b. Raise the time zone file version (TSTZ) to the newest one shipped in
+#     this Oracle Home. dbca creates the database with the base release's
+#     version (32 on 19c), not the one the RU brings along (RUs install newer
+#     timezlrg_*.dat files but never upgrade an existing database). impdp
+#     refuses dumps exported from a newer TSTZ version (ORA-39405), so every
+#     consumer importing such a dump has to run DBMS_DST itself at container
+#     start - two extra instance/PDB restarts plus a failed first import,
+#     every single time. Same reasoning as COMPATIBLE above: do it once,
+#     here. CDB$ROOT and both variant PDBs are upgraded (PDB$SEED is left as
+#     is: nothing is ever cloned from it after this point). Each container is
+#     skipped if it is already at the target version, so this is a no-op for
+#     a base image that already ships an up-to-date database.
+# ---------------------------------------------------------------------------
+tz_value() {  # $1 = container, $2 = SELECT returning a single value
+  sqlplus -s / as sysdba <<SQL | tr -d ' \t\r\n'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+WHENEVER SQLERROR EXIT FAILURE
+ALTER SESSION SET CONTAINER = $1;
+$2
+EXIT
+SQL
+}
+tz_version() {  # $1 = container
+  tz_value "$1" "SELECT property_value FROM database_properties WHERE property_name = 'DST_PRIMARY_TT_VERSION';"
+}
+
+TZ_TARGET=$(tz_value 'CDB$ROOT' "SELECT DBMS_DST.GET_LATEST_TIMEZONE_VERSION FROM dual;") || TZ_TARGET=""
+if ! [[ "${TZ_TARGET}" =~ ^[0-9]+$ ]]; then
+  # Fallback: the highest timezlrg_<n>.dat file in this Oracle Home.
+  TZ_TARGET=$(find "${ORACLE_HOME}/oracore/zoneinfo" -maxdepth 1 -name 'timezlrg_*.dat' -printf '%f\n' \
+    | sed -E 's/^timezlrg_([0-9]+)\.dat$/\1/' | sort -n | tail -1)
+fi
+if ! [[ "${TZ_TARGET}" =~ ^[0-9]+$ ]]; then
+  log "ERROR: could not determine the latest time zone version in this Oracle Home (got '${TZ_TARGET}')."
+  exit 1
+fi
+log "upgrading time zone file version to ${TZ_TARGET} (newest in this Oracle Home)..."
+
+# CDB$ROOT: BEGIN_UPGRADE needs the instance in UPGRADE mode, the actual
+# data upgrade then runs after a normal restart (the variant PDBs reopen via
+# their SAVE STATE).
+if [ "$(tz_version 'CDB$ROOT')" -ge "${TZ_TARGET}" ]; then
+  log "  CDB\$ROOT already at ${TZ_TARGET}, skipped"
+else
+  sql <<EOF
+SHUTDOWN IMMEDIATE;
+STARTUP UPGRADE;
+EXEC DBMS_DST.BEGIN_UPGRADE(${TZ_TARGET});
+SHUTDOWN IMMEDIATE;
+STARTUP;
+DECLARE
+  failures BINARY_INTEGER;
+BEGIN
+  DBMS_DST.UPGRADE_DATABASE(failures, parallel => TRUE, log_errors => TRUE);
+  DBMS_DST.END_UPGRADE(failures);
+  IF failures > 0 THEN
+    RAISE_APPLICATION_ERROR(-20001, 'DST upgrade of CDB\$ROOT ended with ' || failures || ' failures');
+  END IF;
+END;
+/
+EOF
+fi
+
+# Each PDB: same sequence, with the PDB (not the instance) reopened in
+# UPGRADE mode.
+for pdb in "${PDB_ISO}" "${PDB_UTF8}"; do
+  if [ "$(tz_version "${pdb}")" -ge "${TZ_TARGET}" ]; then
+    log "  ${pdb} already at ${TZ_TARGET}, skipped"
+    continue
+  fi
+  sql <<EOF
+ALTER PLUGGABLE DATABASE ${pdb} CLOSE IMMEDIATE;
+ALTER PLUGGABLE DATABASE ${pdb} OPEN UPGRADE;
+ALTER SESSION SET CONTAINER = ${pdb};
+EXEC DBMS_DST.BEGIN_UPGRADE(${TZ_TARGET});
+ALTER PLUGGABLE DATABASE CLOSE IMMEDIATE;
+ALTER PLUGGABLE DATABASE OPEN;
+DECLARE
+  failures BINARY_INTEGER;
+BEGIN
+  DBMS_DST.UPGRADE_DATABASE(failures, parallel => TRUE, log_errors => TRUE);
+  DBMS_DST.END_UPGRADE(failures);
+  IF failures > 0 THEN
+    RAISE_APPLICATION_ERROR(-20001, 'DST upgrade of ${pdb} ended with ' || failures || ' failures');
+  END IF;
+END;
+/
+EOF
+done
+
+for c in 'CDB$ROOT' "${PDB_ISO}" "${PDB_UTF8}"; do
+  v=$(tz_version "${c}")
+  log "  ${c}: time zone file version ${v}"
+  if [ "${v}" != "${TZ_TARGET}" ]; then
+    log "ERROR: ${c} is at time zone file version ${v}, expected ${TZ_TARGET}."
+    exit 1
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # 3. Shrink the redo logs. dbca's default sizing (3 groups x 200MB here) is
 #    generic, not tuned for this image - a faststart container's database
 #     is a fixed, one-shot state with low expected write volume, so smaller
